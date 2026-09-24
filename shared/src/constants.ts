@@ -56,10 +56,16 @@ export const COLOR_VI: Record<TeamColor, string> = {
   Black: "Đen",
 };
 
-// ---- Luật chiến thắng "Bốn vành đai" (xem docs/game_mechanics.md mục 8)
-export const PRESTIGE_WIN = 400;        // Uy thế cần để thắng
+// ---- Luật chiến thắng "Đầu cầu" bản 2 (xem docs/rules_v2_dau_cau.md)
+export const PRESTIGE_WIN = 500;        // Uy thế cần để thắng (V2: 500)
 export const TIME_LIMIT = 20 * 60;      // giây game; hết giờ thì so Uy thế
 export const SURRENDER_FRAC = 0.15;     // còn dưới 15% quân chiến đấu → đầu hàng
+
+// ---- Uy thế V2
+export const RIVER_PRESTIGE_RATE = 0;     // chiếm cầu KHÔNG cộng Uy thế nữa
+export const FLAG_BRIDGEHEAD_RATE = 1;    // cờ địch đang cắm & còn đầu cầu: +1/giây
+export const FLAG_ISOLATE_T = 30;         // cờ bị cô lập (mất đầu cầu) tự trả về sau 30 giây
+export const REAR_DMG_NO_BRIDGE = 0.25;   // không giữ Cầu giữa: công trình/Thành địch chỉ nhận 25% sát thương
 export const CAP_RIVER_R = 8;           // bán kính cứ điểm sông (ô)
 export const CAP_FLAG_R = 6;            // bán kính cờ cao nguyên (ô, chỉ tính quân trên đỉnh)
 export const CAP_NEUTRAL_T = 10;        // giây chiếm cứ điểm trung lập
@@ -105,3 +111,25 @@ export const CHARGE_MULT = 1.5;         // Thương kỵ xung phong vào khối 
 export const FORD_TAKEN = 1.25;         // đang lội bãi cạn nhận thêm sát thương
 export const BIG_ARMY = 600;            // cụm lớn hơn thế này trong vùng 16×16 ô lộ "bụi mù"
 export const BIG_ARMY_CELL = 16;
+
+// ---- Bố trí đội hình (Deployment)
+export const DEPLOYMENT_BOUNDS = {
+  WEST: { xMin: 50, xMax: 98, yMin: 160, yMax: 352 },
+  EAST: { xMin: 414, xMax: 462, yMin: 160, yMax: 352 },
+};
+// Khoảng cách tối đa (pixel) giữa các khối quân để tự động gom chung thành 1 đạo quân
+export const ARMY_GROUP_LINK_DISTANCE = 512; // 8 ô bản đồ
+
+// ---- Cờ nhà (V2 mục 4): lợi thế phòng thủ
+export const FLAG_HOME_HEAL_R = 12;       // bán kính hồi máu quanh cờ nhà (ô)
+export const FLAG_HOME_HEAL_RATE = 0.02;  // 2% HP tối đa mỗi giây
+export const FLAG_HOME_REST_T = 5;        // không giao chiến 5 giây mới hồi
+export const FLAG_HOME_ARCHER_RANGE = 1;  // cung thủ trên đỉnh cờ nhà +1 ô tầm bắn
+
+// ---- Kho lương (V2 mục 5)
+export const DEPOT_SCHEDULE = [5 * 60, 9 * 60, 13 * 60, 17 * 60]; // phút 5, 9, 13, 17 (giây game)
+export const DEPOT_WARN_T = 60;           // báo trước 60 giây
+export const DEPOT_VALUE = 60;            // +60 Uy thế khi lấy được
+export const DEPOT_CAP_T = 15;            // giữ 15 giây để lấy
+export const DEPOT_CAP_R = 6;             // bán kính chiếm (ô)
+export const DEPOT_EXPIRE_T = 120;        // kho tồn tại 2 phút rồi biến mất

@@ -8,6 +8,8 @@ import { generateMap, passable } from "@game/shared";
 import { Renderer, type Camera, type ViewOptions } from "@/lib/game/renderer";
 import { World, AICommander, MOVE_ATTACK, MOVE_MARCH, OBJ_FLAG, OBJ_RIVER, PRESTIGE_WIN, STANCE_DEFEND, STANCE_PURSUE, TIME_LIMIT, type GameEvent, type WinReason } from "@game/shared";
 import { HowToPlay } from "./HowToPlay";
+import { Deployment } from "./Deployment";
+import type { GameMap } from "@game/shared";
 
 const UI = "/assets/UI%20Elements/UI%20Elements";
 const TICK = 0.1;
@@ -144,6 +146,7 @@ export default function BattleMap() {
   const keys = useRef(new Set<string>());
   const modeRef = useRef<Mode | null>(null);
   const aiRef = useRef<AICommander | null>(null);
+  const mapRef = useRef<GameMap | null>(null);
   const armedRef = useRef(false);          // F: lệnh chuột phải kế tiếp là Tấn công
   const knownRef = useRef<Int8Array | null>(null); // chủ sở hữu mục tiêu phe mình biết
 
@@ -167,16 +170,58 @@ export default function BattleMap() {
   const [showHelp, setShowHelp] = useState(false);
   const [armed, setArmed] = useState(false);
   const [hideVictory, setHideVictory] = useState(false);
+  const [isDeploying, setIsDeploying] = useState(false);
+  const [focusGroupId, setFocusGroupId] = useState(-1);
+  const cycleGroupRef = useRef<() => void>(() => {});
   const setArmedBoth = useCallback((v: boolean) => { armedRef.current = v; setArmed(v); }, []);
 
-  const startAI = useCallback(() => {
-    const w = worldRef.current;
-    if (!w) return;
+  const handleStartDeployment = useCallback((layout: { type: number, px: number, py: number }[]) => {
+    if (!mapRef.current) return;
+    const world = new World(mapRef.current, layout);
+    worldRef.current = world;
+    knownRef.current = Int8Array.from(world.obj.map((o) => (o.kind === OBJ_FLAG ? o.home : -1)));
+    optRef.current = { ...optRef.current, objKnown: optRef.current.viewer === PLAYER ? knownRef.current : null };
+    
     modeRef.current = "ai";
     setMode("ai");
     setViewer(PLAYER);
-    aiRef.current = new AICommander(w, 1);
+    aiRef.current = new AICommander(world, 1);
+    setIsDeploying(false);
   }, []);
+
+  const cycleGroup = useCallback(() => {
+    const w = worldRef.current;
+    if (!w) return;
+    const side = modeRef.current === "ai" || viewer !== 1 ? PLAYER : 1;
+    let maxId = -1;
+    for (let i = 0; i < w.n; i++) {
+        if (w.side[i] === side && w.armyGroupId[i] > maxId) maxId = w.armyGroupId[i];
+    }
+    if (maxId === -1) return;
+    
+    let nextId = focusGroupId + 1;
+    if (nextId > maxId) nextId = 0;
+    setFocusGroupId(nextId);
+    
+    let cx = 0, cy = 0, count = 0;
+    w.sel.fill(0);
+    for (let i = 0; i < w.n; i++) {
+       if (w.side[i] === side && w.armyGroupId[i] === nextId && w.alive[i]) {
+           w.sel[i] = 1;
+           cx += w.x[i];
+           cy += w.y[i];
+           count++;
+       }
+    }
+    if (count > 0) {
+        camRef.current.targetX = cx / count;
+        camRef.current.targetY = cy / count;
+    }
+  }, [focusGroupId, viewer]);
+  
+  useEffect(() => {
+    cycleGroupRef.current = cycleGroup;
+  }, [cycleGroup]);
 
   const handleFocus = useCallback((type: number) => {
     const w = worldRef.current;
@@ -214,6 +259,7 @@ export default function BattleMap() {
       setLoading({ label: "Đang sinh bản đồ 512×512…", pct: 0.5 });
       await new Promise((r) => setTimeout(r, 30));
       const map = generateMap(seed);
+      mapRef.current = map;
       const world = new World(map);
       rendRef.current?.dispose();
       const rend = new Renderer(map, assets);
@@ -232,7 +278,7 @@ export default function BattleMap() {
       // Người chơi biết chủ cờ nhà của hai bên từ đầu; cứ điểm sông ban đầu trung lập
       knownRef.current = Int8Array.from(world.obj.map((o) => (o.kind === OBJ_FLAG ? o.home : -1)));
       optRef.current = { ...optRef.current, objKnown: optRef.current.viewer === PLAYER ? knownRef.current : null };
-      aiRef.current = modeRef.current === "ai" ? new AICommander(world, 1) : null;
+      aiRef.current = null;
       setHideVictory(false);
       setLoading(null);
     })();
@@ -360,6 +406,10 @@ export default function BattleMap() {
       if (key === "f") setArmedBoth(!armedRef.current);
       if (key === "t") toggleStance(w);
       if (key === "g") w.orderRally(w.selected());
+      if (key === "tab") {
+        e.preventDefault();
+        cycleGroupRef.current?.();
+      }
     };
     const up = (e: KeyboardEvent) => keys.current.delete(e.key.toLowerCase());
     // T: đổi tư thế cả nhóm — đa số đang Phòng thủ thì chuyển Truy kích, ngược lại về Phòng thủ
@@ -536,6 +586,9 @@ export default function BattleMap() {
             </div>
           </div>
         <div className="mt-2 grid grid-cols-2 gap-1">
+          <button className="ts-btn text-sm col-span-2" onClick={cycleGroup}>
+            <img src={`${UI}/Icons/Icon_10.png`} alt="" className="h-6 w-6" /> Chuyển Đạo Quân (Tab)
+          </button>
           <button className="ts-btn red text-sm" disabled={!!loading || !mode} title="Toàn quân tấn công thẳng vào Thành địch (bỏ các cứ điểm!)" onClick={() => worldRef.current?.orderCharge([PLAYER])}>
             <img src={`${UI}/Icons/Icon_05.png`} alt="" className="h-6 w-6" /> Xung trận
           </button>
@@ -683,13 +736,13 @@ export default function BattleMap() {
       )}
 
       {/* ---- menu chọn chế độ */}
-      {!loading && !mode && (
+      {!loading && !mode && !isDeploying && (
         <div className="absolute inset-0 flex items-center justify-center bg-[#1d3b44]/70">
           <div className="ts-wood w-[440px] max-w-[92vw] text-center text-[var(--cream)]">
             <div className="ts-title text-2xl">Đại chiến 9.600 quân</div>
             <div className="mb-3 text-[12px] opacity-80">Chọn chế độ chơi</div>
             <div className="flex flex-col gap-2">
-              <button className="ts-btn red text-base" onClick={startAI}>
+              <button className="ts-btn red text-base" onClick={() => setIsDeploying(true)}>
                 <img src={`${UI}/Icons/Icon_05.png`} alt="" className="h-6 w-6" /> Đánh với máy
               </button>
               <button className="ts-btn text-base opacity-60" disabled title="Đang phát triển">
@@ -705,6 +758,9 @@ export default function BattleMap() {
       )}
 
       {showHelp && <HowToPlay onClose={() => setShowHelp(false)} />}
+      
+      {/* ---- màn hình bố trí */}
+      {isDeploying && <Deployment onStart={handleStartDeployment} />}
 
       {/* ---- loading */}
       {loading && (
@@ -738,10 +794,10 @@ function Legend({ color, name, note }: { color: string; name: string; note: stri
 }
 
 const WIN_REASON_VI: Record<WinReason, string> = {
-  prestige: `Đạt ${PRESTIGE_WIN} Uy thế nhờ giữ cứ điểm sông và cắm cờ trên đất địch.`,
-  castle: "Thành địch đã bị phá.",
+  prestige: `Đạt ${PRESTIGE_WIN} Uy thế nhờ cắm cờ trên đất địch (cần giữ đầu cầu) và phá công trình.`,
+  castle: "Thành địch đã bị phá (cần giữ Cầu giữa để gây đủ sát thương).",
   surrender: "Quân địch còn dưới 15% quân chiến đấu và đã đầu hàng.",
-  time: "Hết 20 phút — phân định bằng Uy thế (hoặc tổng HP nếu bằng nhau).",
+  time: "Hết 20 phút — phân định bằng Uy thế, rồi chỗ vượt sông, rồi tổng HP.",
 };
 
 function fmtTime(t: number) {
