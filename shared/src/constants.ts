@@ -55,3 +55,53 @@ export const COLOR_VI: Record<TeamColor, string> = {
   Purple: "Tím",
   Black: "Đen",
 };
+
+// ---- Luật chiến thắng "Bốn vành đai" (xem docs/game_mechanics.md mục 8)
+export const PRESTIGE_WIN = 400;        // Uy thế cần để thắng
+export const TIME_LIMIT = 20 * 60;      // giây game; hết giờ thì so Uy thế
+export const SURRENDER_FRAC = 0.15;     // còn dưới 15% quân chiến đấu → đầu hàng
+export const CAP_RIVER_R = 8;           // bán kính cứ điểm sông (ô)
+export const CAP_FLAG_R = 6;            // bán kính cờ cao nguyên (ô, chỉ tính quân trên đỉnh)
+export const CAP_NEUTRAL_T = 10;        // giây chiếm cứ điểm trung lập
+export const CAP_ENEMY_T = 20;          // giây chiếm cứ điểm đang thuộc địch
+export const ELITE_CAP_MULT = 1.5;      // phe ít quân hơn chiếm nhanh hơn
+export const FLAG_VISION_R = 20;        // tầm nhìn cố định của cờ nhà
+export const SCOUT_BLIND_T = 5;         // Trinh sát đứng trên đỉnh địch bao lâu để tắt tầm nhìn cờ
+export const SCOUT_BLIND_DUR = 60;
+export const FOREST_REST_T = 8;         // giây không giao chiến để hồi máu trong rừng
+export const FOREST_REGEN = 0.01;       // % HP tối đa mỗi giây
+export const AMBUSH_MULT = 1.5;
+export const LEASH_R = 8;               // tư thế Phòng thủ: đuổi tối đa 8 ô quanh điểm neo
+export const DISORDER_CHASE_T = 6;      // đuổi liên tục quá 6 giây → Rối loạn
+export const DISORDER_DIST = 12;        // hoặc cách neo quá 12 ô
+export const DISORDER_CLEAR_T = 4;      // đứng yên 4 giây thì hết Rối loạn
+export const DISORDER_MULT = 1.25;      // nhận thêm sát thương khi Rối loạn
+export const REAR_MULT = 1.5;           // đánh vào lưng quân đang rút
+export const REAR_MULT_LANCER = 2;
+export const ROUT_KILLS_PER_PRESTIGE = 20;
+export const RALLY_MIN_RETREAT = 3;     // phải rút ít nhất 3 giây mới được thưởng Quay đầu
+export const RALLY_DUR = 5;
+export const RALLY_MULT = 1.3;
+export const TOWER_RANGE = 8;
+export const TOWER_DMG = 12;
+export const TOWER_CD = 1.5;
+export const BUILDING_PRESTIGE: Record<string, number> = {
+  Monastery: 40, Archery: 40, Barracks: 40, Tower: 25, House1: 10, House2: 10, House3: 10,
+};
+
+export const STANCE_DEFEND = 0;
+export const STANCE_PURSUE = 1;
+
+// ---- Cân bằng chống "dồn cục" (docs/game_mechanics.md mục 6)
+export const MELEE_CAP = 3;             // tối đa số lính cận chiến cùng đánh một mục tiêu
+export const CROWD_CELL = 4;            // ô lưới Chen chúc: 4×4 ô bản đồ
+export const CROWD_LIMIT = 60;          // quá số lính cùng phe trong một ô → Chen chúc
+export const CROWD_SPEED = 0.7;
+export const CROWD_MELEE = 0.8;
+export const CROWD_ARROW_TAKEN = 1.3;
+export const VOLLEY_MIN = 6;            // Mưa tên: ô có quá số lính địch này thì tên trúng thêm 1 lính
+export const VOLLEY_SPLASH = 0.5;
+export const CHARGE_MULT = 1.5;         // Thương kỵ xung phong vào khối Chen chúc
+export const FORD_TAKEN = 1.25;         // đang lội bãi cạn nhận thêm sát thương
+export const BIG_ARMY = 600;            // cụm lớn hơn thế này trong vùng 16×16 ô lộ "bụi mù"
+export const BIG_ARMY_CELL = 16;

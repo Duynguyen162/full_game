@@ -6,7 +6,8 @@ import { UNIT_VI, colorPaths, staticPaths } from "@game/shared";
 import { COLORS, COLOR_HEX, COLOR_VI, FORD, MH, MW, SPEED_FORD, T, WATER, WORLD_H, WORLD_W, type TeamColor } from "@game/shared";
 import { generateMap, passable } from "@game/shared";
 import { Renderer, type Camera, type ViewOptions } from "@/lib/game/renderer";
-import { World } from "@game/shared";
+import { World, AICommander, MOVE_ATTACK, MOVE_MARCH, OBJ_FLAG, OBJ_RIVER, PRESTIGE_WIN, STANCE_DEFEND, STANCE_PURSUE, TIME_LIMIT, type GameEvent, type WinReason } from "@game/shared";
+import { HowToPlay } from "./HowToPlay";
 
 const UI = "/assets/UI%20Elements/UI%20Elements";
 const TICK = 0.1;
@@ -26,7 +27,19 @@ interface Stats {
   sel: number[];
   winner: number;
   started: boolean;
+  prestige: [number, number];
+  river: [number, number];
+  flags: [number, number];     // số cờ nội địa địch đang cắm
+  timeLeft: number;
+  winReason: WinReason | null;
+  events: GameEvent[];
+  time: number;
+  stance: [number, number, number]; // phòng thủ / truy kích / giữ vị trí của quân đang chọn
+  ai: string[];
 }
+
+type Mode = "ai" | "pvp";
+const PLAYER = 0; // chế độ đánh với máy: người chơi luôn là phe Tây
 
 interface Hover {
   x: number;
@@ -68,6 +81,14 @@ function drawMinimap(c: HTMLCanvasElement | null, cam: Camera, opt: ViewOptions,
   const S = c.width;
   g.imageSmoothingEnabled = false;
   g.drawImage(r.minimap, 0, 0, S, S);
+  // Sương mù: phủ trước khi vẽ quân/công trình để chấm quân ta vẫn nổi rõ
+  const fog = r.minimapFog(w, opt.viewer);
+  if (fog) {
+    g.save();
+    g.imageSmoothingEnabled = true;
+    g.drawImage(fog, 0, 0, S, S);
+    g.restore();
+  }
   const k = S / WORLD_W;
   for (let s = 0; s < 2; s++) {
     g.fillStyle = COLOR_HEX[opt.colors[s]];
@@ -89,6 +110,21 @@ function drawMinimap(c: HTMLCanvasElement | null, cam: Camera, opt: ViewOptions,
     g.strokeStyle = "#1b1b1b";
     g.fillRect(b.tx * T * k - 1, b.ty * T * k - 1, b.fw * T * k + 2, b.fh * T * k + 2);
   }
+  // Mục tiêu: màu theo chủ sở hữu mà người xem biết (cập nhật khi có tầm nhìn)
+  const kt = S / MW;
+  for (const o of w.obj) {
+    const owner = opt.objKnown ? opt.objKnown[o.id] : w.objOwner[o.id];
+    const x = (o.tx + 0.5) * kt, y = (o.ty + 0.5) * kt, r = o.kind === OBJ_RIVER ? 5 : 4;
+    g.fillStyle = owner >= 0 ? COLOR_HEX[opt.colors[owner]] : "#f3e9c6";
+    g.strokeStyle = "#1b1b1b";
+    g.lineWidth = 1.2;
+    g.beginPath();
+    if (o.kind === OBJ_RIVER) { g.moveTo(x, y - r); g.lineTo(x + r, y); g.lineTo(x, y + r); g.lineTo(x - r, y); }
+    else { g.moveTo(x - r * 0.6, y + r); g.lineTo(x - r * 0.6, y - r); g.lineTo(x + r, y - r * 0.4); g.lineTo(x - r * 0.6, y + r * 0.1); }
+    g.closePath();
+    g.fill();
+    g.stroke();
+  }
   g.strokeStyle = "#fff6c8";
   g.lineWidth = 1.5;
   g.strokeRect((cam.x - vw / 2 / cam.zoom) * k, (cam.y - vh / 2 / cam.zoom) * k, (vw / cam.zoom) * k, (vh / cam.zoom) * k);
@@ -106,6 +142,10 @@ export default function BattleMap() {
   const hoverRef = useRef(-1);
   const boxRef = useRef<[number, number, number, number] | null>(null);
   const keys = useRef(new Set<string>());
+  const modeRef = useRef<Mode | null>(null);
+  const aiRef = useRef<AICommander | null>(null);
+  const armedRef = useRef(false);          // F: lệnh chuột phải kế tiếp là Tấn công
+  const knownRef = useRef<Int8Array | null>(null); // chủ sở hữu mục tiêu phe mình biết
 
   const [seed, setSeed] = useState(12345);
   const [loading, setLoading] = useState<{ label: string; pct: number } | null>({ label: "Đang tải tài nguyên…", pct: 0 });
@@ -120,13 +160,28 @@ export default function BattleMap() {
   const [showTopUI, setShowTopUI] = useState(true);
   const [showLeftUI, setShowLeftUI] = useState(true);
   const [showRightUI, setShowRightUI] = useState(true);
+  const [showMinimap, setShowMinimap] = useState(true);
   const [focusType, setFocusType] = useState<number | null>(null);
   const [focusIdx, setFocusIdx] = useState<number>(0);
+  const [mode, setMode] = useState<Mode | null>(null);
+  const [showHelp, setShowHelp] = useState(false);
+  const [armed, setArmed] = useState(false);
+  const [hideVictory, setHideVictory] = useState(false);
+  const setArmedBoth = useCallback((v: boolean) => { armedRef.current = v; setArmed(v); }, []);
+
+  const startAI = useCallback(() => {
+    const w = worldRef.current;
+    if (!w) return;
+    modeRef.current = "ai";
+    setMode("ai");
+    setViewer(PLAYER);
+    aiRef.current = new AICommander(w, 1);
+  }, []);
 
   const handleFocus = useCallback((type: number) => {
     const w = worldRef.current;
     if (!w) return;
-    const side = viewer === 1 ? 1 : 0;
+    const side = modeRef.current === "ai" || viewer !== 1 ? PLAYER : 1;
     const clusters = w.getClusters(type, side);
     if (clusters.length === 0) return;
     
@@ -142,7 +197,9 @@ export default function BattleMap() {
     camRef.current.targetY = c.y;
   }, [focusType, focusIdx, viewer]);
 
-  useEffect(() => { optRef.current = { viewer, colors, showClouds, showNav }; }, [viewer, colors, showClouds, showNav]);
+  useEffect(() => {
+    optRef.current = { viewer, colors, showClouds, showNav, objKnown: viewer === PLAYER ? knownRef.current : null };
+  }, [viewer, colors, showClouds, showNav]);
   useEffect(() => { speedRef.current = speed; }, [speed]);
 
   // ---- load assets + build map
@@ -172,6 +229,11 @@ export default function BattleMap() {
       if (h.length === 3 && h.every((v) => Number.isFinite(v))) camRef.current = { x: h[0] * T, y: h[1] * T, zoom: h[2] };
       worldRef.current = world;
       rendRef.current = rend;
+      // Người chơi biết chủ cờ nhà của hai bên từ đầu; cứ điểm sông ban đầu trung lập
+      knownRef.current = Int8Array.from(world.obj.map((o) => (o.kind === OBJ_FLAG ? o.home : -1)));
+      optRef.current = { ...optRef.current, objKnown: optRef.current.viewer === PLAYER ? knownRef.current : null };
+      aiRef.current = modeRef.current === "ai" ? new AICommander(world, 1) : null;
+      setHideVictory(false);
       setLoading(null);
     })();
     return () => { cancelled = true; };
@@ -226,9 +288,11 @@ export default function BattleMap() {
 
       clampCam(cam, vw, vh);
 
-      acc += dt * speedRef.current;
+      // Chỉ chạy mô phỏng khi đã chọn chế độ và trận chưa phân thắng bại
+      const running = modeRef.current !== null && w.winner < 0;
+      acc = running ? acc + dt * speedRef.current : 0;
       let steps = 0;
-      while (acc >= TICK && steps < 3) { w.step(TICK); acc -= TICK; steps++; }
+      while (acc >= TICK && steps < 3) { aiRef.current?.update(); w.step(TICK); acc -= TICK; steps++; }
       if (steps === 3) acc = 0;
 
       r.dpr = dpr;
@@ -239,7 +303,22 @@ export default function BattleMap() {
       if (statT > 0.25) {
         statT = 0;
         const sel = [0, 0, 0, 0, 0];
-        for (let i = 0; i < w.n; i++) if (w.sel[i] && w.alive[i]) sel[w.type[i]]++;
+        const stance: [number, number, number] = [0, 0, 0];
+        for (let i = 0; i < w.n; i++) {
+          if (!w.sel[i] || !w.alive[i]) continue;
+          sel[w.type[i]]++;
+          stance[w.hold[i] ? 2 : w.stance[i] === STANCE_PURSUE ? 1 : 0]++;
+        }
+        // Cập nhật hiểu biết của phe mình về chủ sở hữu mục tiêu (chỉ khi đang có tầm nhìn)
+        const known = knownRef.current;
+        if (known) for (const o of w.obj) if (w.visCount[PLAYER][o.ty * MW + o.tx] > 0) known[o.id] = w.objOwner[o.id];
+        const river: [number, number] = [0, 0], flags: [number, number] = [0, 0];
+        for (const o of w.obj) {
+          const ow = w.objOwner[o.id];
+          if (ow < 0) continue;
+          if (o.kind === OBJ_RIVER) river[ow]++;
+          else if (ow !== o.home) flags[ow]++;
+        }
         setStats({
           alive: [...w.aliveCount] as [number, number],
           types: [[...w.typeCount[0]], [...w.typeCount[1]]],
@@ -248,6 +327,15 @@ export default function BattleMap() {
           sel,
           winner: w.winner,
           started: w.started,
+          prestige: [w.prestige[0], w.prestige[1]],
+          river,
+          flags,
+          timeLeft: Math.max(0, TIME_LIMIT - w.time),
+          winReason: w.winReason,
+          events: [...w.events],
+          time: w.time,
+          stance,
+          ai: aiRef.current && optRef.current.viewer !== PLAYER ? [...aiRef.current.status(), "—", ...aiRef.current.log.slice(-5)] : [],
         });
         setZoomPct(Math.round(cam.zoom * 100));
       }
@@ -263,17 +351,27 @@ export default function BattleMap() {
       keys.current.add(e.key.toLowerCase());
       const w = worldRef.current;
       if (!w) return;
-      const side = optRef.current.viewer;
+      const side = modeRef.current === "ai" ? PLAYER : optRef.current.viewer;
+      const key = e.key.toLowerCase();
       if (e.key >= "1" && e.key <= "5") w.selectType(+e.key - 1, side);
-      if (e.key.toLowerCase() === "q") w.selectType(-1, side);
-      if (e.key === "Escape") w.sel.fill(0);
-      if (e.key.toLowerCase() === "h") w.orderHold(w.selected());
+      if (key === "q") w.selectType(-1, side);
+      if (e.key === "Escape") { w.sel.fill(0); setArmedBoth(false); }
+      if (key === "h") w.orderHold(w.selected());
+      if (key === "f") setArmedBoth(!armedRef.current);
+      if (key === "t") toggleStance(w);
+      if (key === "g") w.orderRally(w.selected());
     };
     const up = (e: KeyboardEvent) => keys.current.delete(e.key.toLowerCase());
+    // T: đổi tư thế cả nhóm — đa số đang Phòng thủ thì chuyển Truy kích, ngược lại về Phòng thủ
+    const toggleStance = (w: World) => {
+      const sel = w.selected();
+      const pursue = sel.filter((i) => w.stance[i] === STANCE_PURSUE).length;
+      w.orderStance(sel, pursue * 2 < sel.length ? STANCE_PURSUE : STANCE_DEFEND);
+    };
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
     return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
-  }, []);
+  }, [setArmedBoth]);
 
   const drag = useRef<{ mode: "select" | "pan" | "right"; sx: number; sy: number; cx: number; cy: number; moved: boolean } | null>(null);
   const toWorld = (sx: number, sy: number) => {
@@ -319,7 +417,7 @@ export default function BattleMap() {
     if (!d || !w) return;
     const rect = canvasRef.current!.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
-    const side = optRef.current.viewer;
+    const side = modeRef.current === "ai" ? PLAYER : optRef.current.viewer;
     if (d.mode === "select") {
       const [ax, ay] = toWorld(d.sx, d.sy);
       const [bx, by] = toWorld(sx, sy);
@@ -329,8 +427,11 @@ export default function BattleMap() {
       const [wx, wy] = toWorld(sx, sy);
       const sel = w.selected();
       if (sel.length) {
-        w.orderMove(sel, Math.floor(wx / T), Math.floor(wy / T));
+        // Chuột phải = Hành quân (bỏ qua địch, dùng để rút); F rồi chuột phải / Alt + chuột phải = Tấn công
+        const attack = armedRef.current || e.altKey;
+        w.orderMove(sel, Math.floor(wx / T), Math.floor(wy / T), attack ? MOVE_ATTACK : MOVE_MARCH);
         w.addFx(0, wx, wy, 0); // 0 = FX_DUST
+        if (armedRef.current) setArmedBoth(false);
       }
     }
   };
@@ -376,14 +477,25 @@ export default function BattleMap() {
       {showTopUI && (
         <div className="pointer-events-none absolute left-1/2 top-2 flex -translate-x-1/2 flex-col items-center">
           <div className="pointer-events-auto flex items-center justify-between w-full">
-            <div className={`ts-ribbon ts-ribbon-${colors[0].toLowerCase()} min-w-[420px] px-2 text-lg ts-title mx-auto`}>ĐẠI CHIẾN 40.000 QUÂN</div>
+            <div className={`ts-ribbon ts-ribbon-${colors[0].toLowerCase()} min-w-[420px] px-2 text-lg ts-title mx-auto`}>ĐẠI CHIẾN 9.600 QUÂN</div>
             <button onClick={() => setShowTopUI(false)} className="ts-btn text-xs px-2 py-0 h-6 -ml-10">Ẩn</button>
           </div>
           <div className="ts-wood -mt-2 flex items-center gap-3 text-[var(--cream)]">
             <Army side={0} color={colors[0]} stats={stats} />
-            <span className="ts-title text-2xl text-[#ffd76a] [text-shadow:0_2px_0_#000]">VS</span>
+            <div className="flex flex-col items-center">
+              <span className="ts-title text-2xl text-[#ffd76a] [text-shadow:0_2px_0_#000]">VS</span>
+              <span className="text-[11px] opacity-80">Còn lại</span>
+              <span className="ts-title text-base tabular-nums">{fmtTime(stats?.timeLeft ?? TIME_LIMIT)}</span>
+            </div>
             <Army side={1} color={colors[1]} stats={stats} />
           </div>
+          {stats && stats.events.length > 0 && (
+            <div className="mt-1 flex flex-col items-center gap-0.5">
+              {stats.events.filter((ev) => stats.time - ev.t < 10).slice(-3).map((ev, k) => (
+                <div key={`${ev.t}-${k}`} className="rounded bg-black/55 px-2 py-0.5 text-[12px] font-semibold text-white" style={{ borderLeft: `4px solid ${COLOR_HEX[colors[ev.side]]}` }}>{ev.text}</div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -394,7 +506,10 @@ export default function BattleMap() {
             <span>Bàn chỉ huy</span>
             <button onClick={() => setShowLeftUI(false)} className="ts-btn text-xs px-2 py-0">Ẩn</button>
           </div>
-          <Label>Góc nhìn (tầm nhìn rừng)</Label>
+          <button className="ts-btn mb-2 w-full text-sm" onClick={() => setShowHelp(true)}>
+            <img src={`${UI}/Icons/Icon_01.png`} alt="" className="h-6 w-6" /> Hướng dẫn &amp; luật thắng
+          </button>
+          <Label>{mode === "ai" ? "Góc nhìn (Toàn cảnh = xem AI để thử nghiệm)" : "Góc nhìn (tầm nhìn rừng)"}</Label>
           <div className="mb-2 grid grid-cols-3 gap-1">
             {[[0, "Tây"], [-1, "Toàn cảnh"], [1, "Đông"]].map(([v, l]) => (
               <button key={v} className="ts-btn text-xs" data-on={viewer === v} onClick={() => setViewer(v as number)}>{l}</button>
@@ -402,21 +517,26 @@ export default function BattleMap() {
           </div>
           <div className="mb-2">
             <Label>Đơn vị quân đội</Label>
-            <div className="flex gap-1">
+            <div className="grid grid-cols-3 gap-1">
               {[0, 1, 2, 3, 4].map((t) => (
                 <button
                   key={t}
                   onClick={() => handleFocus(t)}
-                  className={`ts-btn text-xs flex-1 !min-h-[40px] !px-1 ${focusType === t ? "outline outline-2 outline-[#fff6c8]" : ""}`}
-                  title={UNIT_VI[t]}
+                  className={`ts-btn min-w-0 !min-h-[64px] !px-0.5 !py-0.5 flex-col !gap-0 ${focusType === t ? "outline outline-2 outline-[#fff6c8]" : ""}`}
+                  style={{ borderWidth: 8, borderImageWidth: "8px" }}
+                  title={`${UNIT_VI[t]} — bấm để nhảy tới cụm quân`}
                 >
-                  <img src={`${UI}/Human%20Avatars/Avatars_0${AVATAR_TYPE[t]}.png`} alt="" className="h-6 w-6 mx-auto" />
+                  <img src={`${UI}/Human%20Avatars/Avatars_0${AVATAR_TYPE[t]}.png`} alt="" className="ts-pixel h-8 w-8 mx-auto" />
+                  <span className="block w-full truncate text-center text-[10px] leading-tight">{UNIT_VI[t]}</span>
+                  <span className="block text-center text-[10px] leading-tight opacity-80">
+                    {(stats?.types[mode === "ai" || viewer !== 1 ? PLAYER : 1][t] ?? 0).toLocaleString("vi-VN")}
+                  </span>
                 </button>
               ))}
             </div>
           </div>
         <div className="mt-2 grid grid-cols-2 gap-1">
-          <button className="ts-btn red text-sm" disabled={!!loading || !!stats?.started} onClick={() => worldRef.current?.orderCharge([0, 1])}>
+          <button className="ts-btn red text-sm" disabled={!!loading || !mode} title="Toàn quân tấn công thẳng vào Thành địch (bỏ các cứ điểm!)" onClick={() => worldRef.current?.orderCharge([PLAYER])}>
             <img src={`${UI}/Icons/Icon_05.png`} alt="" className="h-6 w-6" /> Xung trận
           </button>
           <button className="ts-btn text-sm" onClick={() => { const w = worldRef.current; if (w) w.orderHold(w.selected()); }}>
@@ -428,17 +548,20 @@ export default function BattleMap() {
           <button className="ts-btn text-sm" data-on={showClouds} onClick={() => setShowClouds(!showClouds)}>
             <img src={`${UI}/Icons/Icon_12.png`} alt="" className="h-6 w-6" /> Mây trời
           </button>
+          <button className="ts-btn text-sm" data-on={showMinimap} onClick={() => setShowMinimap(!showMinimap)}>
+            <img src={`${UI}/Icons/Icon_07.png`} alt="" className="h-6 w-6" /> Bản đồ con
+          </button>
           <button className="ts-btn text-sm" onClick={() => { setLoading({ label: "Đang sinh bản đồ mới…", pct: 0.5 }); setSeed((s) => (s * 16807) % 2147483647); }}>
             <img src={`${UI}/Icons/Icon_10.png`} alt="" className="h-6 w-6" /> Bản đồ mới
           </button>
-          <div className="grid grid-cols-3 gap-1">
+          <div className="col-span-2 grid grid-cols-3 gap-1">
             {[0, 1, 3].map((v) => (
               <button key={v} aria-label={v === 0 ? "Tạm dừng" : `Tốc độ ${v}x`} className="ts-btn !min-h-[48px] min-w-0 text-xs" data-on={speed === v} onClick={() => setSpeed(v)}>{v === 0 ? "II" : `${v}x`}</button>
             ))}
           </div>
         </div>
           <div className="mt-2 text-[11px] leading-snug opacity-80">
-            Kéo chuột trái: chọn quân · Chuột phải: ra lệnh · Kéo chuột phải/giữa hoặc WASD: di chuyển · Lăn chuột: phóng to · 1–5: chọn binh chủng · Q: cả đạo quân · H: giữ vị trí
+            Kéo chuột trái: chọn quân · <b>Chuột phải: Hành quân</b> (bỏ qua địch, dùng để rút) · <b>F rồi chuột phải</b> (hoặc Alt + chuột phải): Tấn công · T: Phòng thủ/Truy kích · G: Quay đầu · H: Giữ vị trí · 1–5: chọn binh chủng · Q: cả đạo quân · WASD / kéo chuột phải: di chuyển camera
           </div>
         </div>
       )}
@@ -494,9 +617,11 @@ export default function BattleMap() {
       )}
 
       {/* ---- bottom-right: minimap */}
-      <div className="ts-banner absolute bottom-2 right-2">
-        <canvas ref={miniRef} width={220} height={220} className="block h-[220px] w-[220px] [image-rendering:pixelated]" onPointerDown={miniNav} onPointerMove={miniNav} />
-      </div>
+      {showMinimap && (
+        <div className="ts-banner absolute bottom-2 right-2">
+          <canvas ref={miniRef} width={220} height={220} className="block h-[220px] w-[220px] [image-rendering:pixelated]" onPointerDown={miniNav} onPointerMove={miniNav} />
+        </div>
+      )}
 
       {/* ---- bottom-center: selection */}
       {selTotal > 0 && stats && (
@@ -509,19 +634,77 @@ export default function BattleMap() {
               <span className="text-[11px]">{n.toLocaleString("vi-VN")}</span>
             </div>
           ))}
-          <div className="text-[11px] opacity-70">Chuột phải để<br />hành quân</div>
+          <div className="flex flex-col gap-1 border-l border-[#3b2416]/30 pl-3">
+            <div className="text-[11px]">
+              Tư thế: <b>{stats.stance[2] >= stats.stance[0] && stats.stance[2] >= stats.stance[1] ? "Giữ vị trí" : stats.stance[1] > stats.stance[0] ? "Truy kích" : "Phòng thủ"}</b>
+            </div>
+            <div className="grid grid-cols-2 gap-1">
+              <button className="ts-btn red !min-h-[36px] text-[11px]" data-on={armed} onClick={() => setArmedBoth(!armed)}>{armed ? "Chọn đích…" : "Tấn công (F)"}</button>
+              <button className="ts-btn !min-h-[36px] text-[11px]" onClick={() => {
+                const w = worldRef.current; if (!w) return;
+                const sel = w.selected();
+                w.orderStance(sel, stats.stance[1] * 2 < sel.length ? STANCE_PURSUE : STANCE_DEFEND);
+              }}>{stats.stance[1] * 2 < selTotal ? "Truy kích (T)" : "Phòng thủ (T)"}</button>
+              <button className="ts-btn !min-h-[36px] text-[11px]" onClick={() => { const w = worldRef.current; if (w) w.orderRally(w.selected()); }}>Quay đầu (G)</button>
+              <button className="ts-btn !min-h-[36px] text-[11px]" onClick={() => { const w = worldRef.current; if (w) w.orderHold(w.selected()); }}>Giữ (H)</button>
+            </div>
+            <div className="text-[10px] opacity-70">{armed ? "Chuột phải vào đích để tấn công" : "Chuột phải = hành quân (bỏ qua địch)"}</div>
+          </div>
+        </div>
+      )}
+
+      {/* ---- AI debug (chỉ khi xem Toàn cảnh / phe Đông) */}
+      {mode === "ai" && stats && stats.ai.length > 0 && (
+        <div className="absolute bottom-[240px] right-2 w-[300px] rounded bg-black/70 p-2 text-[11px] leading-snug text-[#f3e9c6]">
+          <div className="mb-1 font-bold text-[#ffd76a]">Chỉ huy máy (phe Đông) — chế độ thử nghiệm</div>
+          {stats.ai.map((l, k) => <div key={k}>{l}</div>)}
         </div>
       )}
 
       {/* ---- victory */}
-      {stats && stats.winner >= 0 && (
+      {stats && stats.winner >= 0 && !hideVictory && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/40">
-          <div className="relative">
-            <img src={`/assets/UI%20Elements/UI%20Banners%20from%20the%20store%20page/Ribbons/Ribbon_${colors[stats.winner]}.png`} alt="" className="ts-pixel w-[640px]" />
-            <div className="ts-title absolute inset-x-0 top-[40%] text-center text-3xl text-white [text-shadow:0_3px_0_#000]">Quân {stats.winner === 0 ? "Tây" : "Đông"} chiến thắng!</div>
+          <div className="flex flex-col items-center">
+            <div className={`ts-ribbon ts-ribbon-${colors[stats.winner].toLowerCase()} ts-title min-w-[480px] max-w-[92vw] px-4 text-center text-3xl text-white [text-shadow:0_3px_0_#000]`}>
+              {mode === "ai" ? (stats.winner === PLAYER ? "Bạn chiến thắng!" : "Máy chiến thắng!") : `Quân ${stats.winner === 0 ? "Tây" : "Đông"} chiến thắng!`}
+            </div>
+            <div className="ts-paper mt-2 max-w-[520px] text-center text-[var(--ink)]">
+              <div className="font-bold">{WIN_REASON_VI[stats.winReason ?? "castle"]}</div>
+              <div className="text-[12px] opacity-80">
+                Uy thế {Math.floor(stats.prestige[0])} – {Math.floor(stats.prestige[1])} · Quân còn {stats.alive[0].toLocaleString("vi-VN")} – {stats.alive[1].toLocaleString("vi-VN")} · Thời gian {fmtTime(stats.time)}
+              </div>
+              <div className="mt-2 flex justify-center gap-2">
+                <button className="ts-btn red text-sm" onClick={() => { modeRef.current = null; setMode(null); aiRef.current = null; setLoading({ label: "Đang sinh bản đồ mới…", pct: 0.5 }); setSeed((s) => (s * 16807) % 2147483647); }}>Chơi lại</button>
+                <button className="ts-btn text-sm" onClick={() => setHideVictory(true)}>Xem chiến trường</button>
+              </div>
+            </div>
           </div>
         </div>
       )}
+
+      {/* ---- menu chọn chế độ */}
+      {!loading && !mode && (
+        <div className="absolute inset-0 flex items-center justify-center bg-[#1d3b44]/70">
+          <div className="ts-wood w-[440px] max-w-[92vw] text-center text-[var(--cream)]">
+            <div className="ts-title text-2xl">Đại chiến 9.600 quân</div>
+            <div className="mb-3 text-[12px] opacity-80">Chọn chế độ chơi</div>
+            <div className="flex flex-col gap-2">
+              <button className="ts-btn red text-base" onClick={startAI}>
+                <img src={`${UI}/Icons/Icon_05.png`} alt="" className="h-6 w-6" /> Đánh với máy
+              </button>
+              <button className="ts-btn text-base opacity-60" disabled title="Đang phát triển">
+                <img src={`${UI}/Icons/Icon_08.png`} alt="" className="h-6 w-6" /> PvP — 2 người (sắp ra mắt 🔒)
+              </button>
+              <button className="ts-btn text-base" onClick={() => setShowHelp(true)}>
+                <img src={`${UI}/Icons/Icon_01.png`} alt="" className="h-6 w-6" /> Hướng dẫn chơi
+              </button>
+            </div>
+            <div className="mt-3 text-[11px] opacity-75">Bạn chỉ huy quân Tây (bên trái). Máy chỉ huy quân Đông.</div>
+          </div>
+        </div>
+      )}
+
+      {showHelp && <HowToPlay onClose={() => setShowHelp(false)} />}
 
       {/* ---- loading */}
       {loading && (
@@ -529,7 +712,7 @@ export default function BattleMap() {
           <div className="relative flex w-[520px] max-w-[92vw] flex-col items-center">
             <img src="/assets/UI%20Elements/UI%20Banners%20from%20the%20store%20page/Banner/Banner.png" alt="" className="ts-pixel w-full" />
             <div className="absolute inset-x-[14%] top-[30%] flex flex-col items-center gap-3 text-[var(--ink)]">
-              <div className="ts-title text-center text-2xl">Tiny Swords<br />Đại chiến 40.000 quân</div>
+              <div className="ts-title text-center text-2xl">Tiny Swords<br />Đại chiến 9.600 quân</div>
               <div className="ts-bar w-full"><span style={{ width: `${Math.round(loading.pct * 100)}%` }} /></div>
               <div className="text-sm">{loading.label}</div>
             </div>
@@ -554,9 +737,21 @@ function Legend({ color, name, note }: { color: string; name: string; note: stri
   );
 }
 
+const WIN_REASON_VI: Record<WinReason, string> = {
+  prestige: `Đạt ${PRESTIGE_WIN} Uy thế nhờ giữ cứ điểm sông và cắm cờ trên đất địch.`,
+  castle: "Thành địch đã bị phá.",
+  surrender: "Quân địch còn dưới 15% quân chiến đấu và đã đầu hàng.",
+  time: "Hết 20 phút — phân định bằng Uy thế (hoặc tổng HP nếu bằng nhau).",
+};
+
+function fmtTime(t: number) {
+  const m = Math.floor(t / 60), s = Math.floor(t % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
 function Army({ side, color, stats }: { side: 0 | 1; color: TeamColor; stats: Stats | null }) {
-  const alive = stats?.alive[side] ?? 20000;
-  const res = stats?.res[side];
+  const alive = stats?.alive[side] ?? 4805;
+  const prestige = stats?.prestige[side] ?? 0;
   const avatar = side === 0 ? "01" : "05";
   return (
     <div className={`flex items-center gap-2 ${side === 1 ? "flex-row-reverse text-right" : ""}`}>
@@ -564,11 +759,17 @@ function Army({ side, color, stats }: { side: 0 | 1; color: TeamColor; stats: St
       <div>
         <div className="ts-title [text-shadow:0_1px_0_#000,0_0_6px_rgba(0,0,0,.6)]" style={{ color: COLOR_HEX[color] }}>Quân {side === 0 ? "Tây" : "Đông"} · {COLOR_VI[color]}</div>
         <div className="ts-title text-xl">{alive.toLocaleString("vi-VN")}</div>
-        <div className="ts-sword w-[150px]" style={{ borderImageSource: `url(/ui/sword-${color.toLowerCase()}.png)`, width: `${40 + 110 * (alive / 20000)}px` }} />
+        <div className="ts-sword w-[150px]" style={{ borderImageSource: `url(/ui/sword-${color.toLowerCase()}.png)`, width: `${40 + 110 * (alive / 4805)}px` }} />
+        <div className={`mt-1 flex items-center gap-1 text-[11px] ${side === 1 ? "flex-row-reverse" : ""}`}>
+          <span className="font-bold">Uy thế</span>
+          <div className="h-2.5 w-[110px] overflow-hidden rounded-sm border border-black/50 bg-black/40">
+            <div className="h-full" style={{ width: `${Math.min(100, (prestige / PRESTIGE_WIN) * 100)}%`, background: COLOR_HEX[color], marginLeft: side === 1 ? "auto" : 0 }} />
+          </div>
+          <span className="tabular-nums">{Math.floor(prestige)}/{PRESTIGE_WIN}</span>
+        </div>
         <div className={`mt-0.5 flex gap-2 text-[11px] ${side === 1 ? "justify-end" : ""}`}>
-          <Res icon="Icon_03" v={res?.gold ?? 0} />
-          <Res icon="Icon_02" v={res?.wood ?? 0} />
-          <Res icon="Icon_04" v={res?.meat ?? 0} />
+          <span title="Cứ điểm sông đang giữ">◆ Sông {stats?.river[side] ?? 0}/5</span>
+          <span title="Cờ đang cắm trên đất địch">⚑ Cờ địch {stats?.flags[side] ?? 0}</span>
           <span className="flex items-center gap-0.5"><img src={`${UI}/Icons/Icon_09.png`} alt="Hạ gục" className="h-4 w-4" />{stats?.kills[side] ?? 0}</span>
         </div>
       </div>
@@ -576,11 +777,4 @@ function Army({ side, color, stats }: { side: 0 | 1; color: TeamColor; stats: St
   );
 }
 
-function Res({ icon, v }: { icon: string; v: number }) {
-  return (
-    <span className="flex items-center gap-0.5">
-      <img src={`${UI}/Icons/${icon}.png`} alt="" className="h-4 w-4" />
-      {v}
-    </span>
-  );
-}
+

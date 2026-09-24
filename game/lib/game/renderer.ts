@@ -14,7 +14,7 @@ import {
   type Building, type GameMap,
 } from "@game/shared";
 import { hash2 } from "@game/shared";
-import { FX_DUST, FX_EXPLOSION, FX_HEAL, FX_SPLASH, VIS_RADIUS, type World } from "@game/shared";
+import { FX_DUST, FX_EXPLOSION, FX_HEAL, FX_SPLASH, OBJ_RIVER, type World } from "@game/shared";
 
 export interface Camera { x: number; y: number; zoom: number; targetX?: number; targetY?: number; }
 
@@ -23,6 +23,8 @@ export interface ViewOptions {
   colors: [TeamColor, TeamColor];
   showClouds: boolean;
   showNav: boolean;
+  // Chủ sở hữu mục tiêu mà người xem biết được (cập nhật khi có tầm nhìn). null = dùng giá trị thật.
+  objKnown?: Int8Array | null;
 }
 
 const UNIT_SCALE = 0.72;
@@ -41,6 +43,12 @@ export class Renderer {
   private fogCtx: CanvasRenderingContext2D;
   private fogImg: ImageData;           // buffer 4-byte/ô
   private fogAlpha = new Float32Array(N); // alpha hiện tại (lerp’d), 0.0–1.0
+  // ---- Sương mù cho bản đồ con: dựng lại toàn bộ 512×512 theo nhịp updateVision (3Hz)
+  private mmFogCanvas: HTMLCanvasElement;
+  private mmFogCtx: CanvasRenderingContext2D;
+  private mmFogImg: ImageData;
+  private mmFogT = -1;
+  private mmFogViewer = -2;
 
   constructor(private m: GameMap, private a: Assets) {
     this.minimap = this.buildMinimap();
@@ -52,6 +60,29 @@ export class Renderer {
     this.fogImg = this.fogCtx.createImageData(MW, MH);
     // Khởi tạo mờ 55% (đã biết địa hình, chưa có tầm nhìn) — không đen đặc
     this.fogAlpha.fill(0.55);
+    this.mmFogCanvas = document.createElement("canvas");
+    this.mmFogCanvas.width = MW;
+    this.mmFogCanvas.height = MH;
+    this.mmFogCtx = this.mmFogCanvas.getContext("2d")!;
+    this.mmFogImg = this.mmFogCtx.createImageData(MW, MH);
+  }
+
+  // Lớp sương mù phủ lên bản đồ con của phe `viewer`. Spectator (viewer < 0) → null.
+  minimapFog(w: World, viewer: number): HTMLCanvasElement | null {
+    if (viewer < 0) return null;
+    // visCount chỉ đổi 3Hz, nên chỉ dựng lại khi đã qua ~1 nhịp hoặc đổi góc nhìn
+    if (viewer === this.mmFogViewer && Math.abs(w.time - this.mmFogT) < 0.3) return this.mmFogCanvas;
+    this.mmFogT = w.time;
+    this.mmFogViewer = viewer;
+    const s = viewer as 0 | 1;
+    const vc = w.visCount[s], ex = w.explored[s];
+    const d = this.mmFogImg.data;
+    for (let t = 0; t < N; t++) {
+      // Cùng 3 mức với drawFog nhưng đậm hơn một chút để nổi rõ trên ảnh thu nhỏ
+      d[t * 4 + 3] = vc[t] > 0 ? 0 : ex[t] ? 160 : 255;
+    }
+    this.mmFogCtx.putImageData(this.mmFogImg, 0, 0);
+    return this.mmFogCanvas;
   }
 
   dispose() {
@@ -369,6 +400,7 @@ export class Renderer {
     }
     // ---- Sương mù: vẽ sau units, trước mây và UI
     this.drawFog(ctx, w, opt.viewer, wx0, wy0, wx1, wy1, dt);
+    this.drawObjectives(ctx, w, opt, cam.zoom, wx0, wy0, wx1, wy1);
     if (opt.showNav) this.drawNav(ctx, tx0, ty0, tx1, ty1);
     if (hoverTile >= 0 && ts >= 14) {
       ctx.strokeStyle = "rgba(255,255,255,0.8)";
@@ -384,6 +416,67 @@ export class Renderer {
       ctx.lineWidth = 1.5;
       ctx.fillRect(Math.min(ax, bx), Math.min(ay, by), Math.abs(bx - ax), Math.abs(by - ay));
       ctx.strokeRect(Math.min(ax, bx), Math.min(ay, by), Math.abs(bx - ax), Math.abs(by - ay));
+    }
+  }
+
+  // ---- Cứ điểm sông & cờ cao nguyên: vòng chiếm + cung tiến độ + nhãn
+  private drawObjectives(ctx: CanvasRenderingContext2D, w: World, opt: ViewOptions, zoom: number, wx0: number, wy0: number, wx1: number, wy1: number) {
+    const px = 1 / zoom; // 1 pixel màn hình theo đơn vị thế giới
+    for (const o of w.obj) {
+      const cx = (o.tx + 0.5) * T, cy = (o.ty + 0.5) * T, R = o.r * T;
+      if (cx + R < wx0 || cx - R > wx1 || cy + R < wy0 || cy - R > wy1) continue;
+      const owner = opt.objKnown ? opt.objKnown[o.id] : w.objOwner[o.id];
+      const col = owner >= 0 ? COLOR_HEX[opt.colors[owner]] : "#f3e9c6";
+      ctx.save();
+      ctx.globalAlpha = 0.9;
+      ctx.lineWidth = Math.max(3 * px, 10);
+      ctx.setLineDash(o.kind === OBJ_RIVER ? [] : [40, 24]);
+      ctx.strokeStyle = col;
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = owner >= 0 ? col : "rgba(243,233,198,0.5)";
+      ctx.globalAlpha = 0.14;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      // tiến độ chiếm chỉ thấy khi người xem có tầm nhìn tới mục tiêu
+      const seen = opt.viewer < 0 || w.visCount[opt.viewer as 0 | 1][o.ty * MW + o.tx] > 0;
+      const cs = w.objCapSide[o.id];
+      if (seen && cs >= 0 && w.objProg[o.id] > 0) {
+        ctx.strokeStyle = COLOR_HEX[opt.colors[cs]];
+        ctx.lineWidth = Math.max(6 * px, 22);
+        ctx.beginPath();
+        ctx.arc(cx, cy, R * 0.82, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * w.objProg[o.id]);
+        ctx.stroke();
+      }
+      // biểu tượng ở tâm: cờ (tam giác) hoặc kim cương (cứ điểm sông)
+      const s = Math.max(14 * px, 48);
+      ctx.fillStyle = col;
+      ctx.strokeStyle = "#1b1b1b";
+      ctx.lineWidth = Math.max(1.5 * px, 5);
+      ctx.beginPath();
+      if (o.kind === OBJ_RIVER) {
+        ctx.moveTo(cx, cy - s); ctx.lineTo(cx + s, cy); ctx.lineTo(cx, cy + s); ctx.lineTo(cx - s, cy); ctx.closePath();
+      } else {
+        ctx.moveTo(cx - s * 0.5, cy + s); ctx.lineTo(cx - s * 0.5, cy - s); ctx.lineTo(cx + s * 0.9, cy - s * 0.45); ctx.lineTo(cx - s * 0.5, cy + s * 0.1); ctx.closePath();
+      }
+      ctx.fill();
+      ctx.stroke();
+      if (seen && w.objContested[o.id]) {
+        ctx.fillStyle = "#ffdf5a";
+        ctx.font = `bold ${Math.max(14 * px, 40)}px sans-serif`;
+        ctx.textAlign = "center";
+        ctx.fillText("⚔", cx, cy - s * 1.4);
+      }
+      ctx.font = `bold ${Math.max(12 * px, 36)}px sans-serif`;
+      ctx.textAlign = "center";
+      ctx.lineWidth = Math.max(3 * px, 8);
+      ctx.strokeStyle = "rgba(0,0,0,0.75)";
+      ctx.strokeText(o.label, cx, cy + s + Math.max(14 * px, 44));
+      ctx.fillStyle = "#fff6c8";
+      ctx.fillText(o.label, cx, cy + s + Math.max(14 * px, 44));
+      ctx.restore();
     }
   }
 
