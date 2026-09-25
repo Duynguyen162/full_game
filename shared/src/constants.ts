@@ -109,6 +109,16 @@ export const VOLLEY_MIN = 6;            // Mưa tên: ô có quá số lính đ�
 export const VOLLEY_SPLASH = 0.5;
 export const CHARGE_MULT = 1.5;         // Thương kỵ xung phong vào khối Chen chúc
 export const FORD_TAKEN = 1.25;         // đang lội bãi cạn nhận thêm sát thương
+// ---- Bơi qua sông & cầu tự xây (đánh úp, KHÔNG mở đầu cầu — đầu cầu vẫn chỉ tính 5 chỗ vượt sông gốc)
+export const SPEED_SWIM = 0.35;         // tốc độ bơi trong nước sâu
+export const SWIM_TAKEN = 1.5;          // đang bơi nhận thêm 50% sát thương (và không đánh được)
+export const MAX_BUILT_BRIDGES = 2;     // mỗi phe tối đa 2 cầu tự xây (đang xây + đã xong); cầu bị phá thì trả lại lượt
+export const BRIDGE_ROWS_BUILT = 3;     // bề ngang cầu tự xây (ô)
+export const BRIDGE_MAX_LEN = 40;       // cầu dài tối đa (ô nước)
+export const BRIDGE_COL_WORK = 36;      // công (lính·giây) để lát xong 1 cột cầu
+export const BRIDGE_CREW_CAP = 12;      // tối đa 12 lính cùng làm một cầu (thêm nữa không nhanh hơn)
+export const BRIDGE_HP_PER_COL = 250;   // máu cầu mỗi cột đã lát
+export const BRIDGE_BASE_HP = 400;      // máu nền (giàn giáo lúc mới bắt đầu)
 export const BIG_ARMY = 600;            // cụm lớn hơn thế này trong vùng 16×16 ô lộ "bụi mù"
 export const BIG_ARMY_CELL = 16;
 

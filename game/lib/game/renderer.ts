@@ -14,7 +14,7 @@ import {
   type Building, type GameMap,
 } from "@game/shared";
 import { hash2 } from "@game/shared";
-import { FX_DUST, FX_EXPLOSION, FX_HEAL, FX_SPLASH, OBJ_RIVER, type World } from "@game/shared";
+import { FX_DUST, FX_EXPLOSION, FX_HEAL, FX_SPLASH, OBJ_RIVER, BRIDGE_COL_WORK, type World } from "@game/shared";
 
 export interface Camera { x: number; y: number; zoom: number; targetX?: number; targetY?: number; }
 
@@ -389,11 +389,13 @@ export class Renderer {
           ctx.drawImage(far.canvas, (cx & 1) * 128, (cy & 1) * 128, 128, 128, cx * 32 * T, cy * 32 * T, 32 * T, 32 * T);
         }
       }
+      this.drawBuiltBridges(ctx, w, opt, tx0, ty0, tx1, ty1, cam.zoom);
       this.drawBuildings(ctx, w, opt, time, tx0, ty0, tx1, ty1, false);
       this.drawUnitDots(ctx, w, opt, presence, wx0, wy0, wx1, wy1, ts);
     } else {
       ctx.imageSmoothingEnabled = false;
       this.drawTerrain(ctx, tx0, ty0, tx1, ty1, time, true, false);
+      this.drawBuiltBridges(ctx, w, opt, tx0, ty0, tx1, ty1, cam.zoom);
       this.drawSorted(ctx, w, opt, presence, time, tx0, ty0, tx1, ty1, wx0, wy0, wx1, wy1);
       this.drawArrows(ctx, w, opt, wx0, wy0, wx1, wy1);
       this.drawFx(ctx, w, wx0, wy0, wx1, wy1);
@@ -416,6 +418,60 @@ export class Renderer {
       ctx.lineWidth = 1.5;
       ctx.fillRect(Math.min(ax, bx), Math.min(ay, by), Math.abs(bx - ax), Math.abs(by - ay));
       ctx.strokeRect(Math.min(ax, bx), Math.min(ay, by), Math.abs(bx - ax), Math.abs(by - ay));
+    }
+  }
+
+  // ---- Cầu tự xây: ván đã lát + giàn giáo phần còn lại + thanh máu (vẽ trực tiếp, không nướng vào chunk)
+  private drawBuiltBridges(ctx: CanvasRenderingContext2D, w: World, opt: ViewOptions, tx0: number, ty0: number, tx1: number, ty1: number, zoom: number) {
+    for (const br of w.builtBridges) {
+      if (!br.alive || br.xb + 2 < tx0 || br.xa - 2 > tx1 || br.y1 + 2 < ty0 || br.y0 - 2 > ty1) continue;
+      const Y0 = br.y0 * T + 6, Y1 = (br.y1 + 1) * T - 6, h = Y1 - Y0;
+      const len = br.xb - br.xa + 1;
+      // giàn giáo (cọc) cho các cột chưa lát
+      ctx.fillStyle = "rgba(59,36,22,0.55)";
+      for (let k = br.built; k < len; k++) {
+        const x = w.bridgeCol(br, k) * T;
+        for (const ry of [Y0 - 4, Y1 - 6]) ctx.fillRect(x + 26, ry, 10, 12);
+      }
+      // ván đã lát (+ cột đang lát vẽ dở theo tiến độ)
+      const cols = br.built + (br.done ? 0 : Math.min(1, br.work / BRIDGE_COL_WORK));
+      for (let k = 0; k < Math.ceil(cols); k++) {
+        const frac = Math.min(1, cols - k);
+        const cx = w.bridgeCol(br, k) * T;
+        const x = br.dir > 0 ? cx : cx + T * (1 - frac), wd = T * frac;
+        ctx.fillStyle = "rgba(20,40,50,0.28)";
+        ctx.fillRect(x, Y0 + 14, wd, h);
+        ctx.fillStyle = "#3b2416";
+        ctx.fillRect(x, Y0 - 4, wd, h + 8);
+        for (let px = x, j = 0; px < x + wd; px += 16, j++) {
+          ctx.fillStyle = (k * 4 + j) % 2 ? "#a86a3c" : "#b87a48";
+          ctx.fillRect(px, Y0, Math.min(14, x + wd - px), h);
+          ctx.fillStyle = "#cf9660";
+          ctx.fillRect(px, Y0, Math.min(14, x + wd - px), 4);
+        }
+        for (const ry of [Y0 - 8, Y1 - 4]) {
+          ctx.fillStyle = "#3b2416";
+          ctx.fillRect(x, ry - 2, wd, 12);
+          ctx.fillStyle = "#7d4a27";
+          ctx.fillRect(x, ry, wd, 8);
+        }
+      }
+      // cờ phe ở đầu cầu + thanh máu / tiến độ
+      const bankX = (br.dir > 0 ? br.xa : br.xb + 1) * T;
+      ctx.fillStyle = COLOR_HEX[opt.colors[br.side]];
+      ctx.fillRect(bankX - 3, Y0 - 40, 6, 36);
+      ctx.fillRect(bankX + (br.dir > 0 ? -22 : 3), Y0 - 40, 19, 12);
+      if (zoom > 0.12 && (br.hp < br.maxHp || !br.done)) {
+        const bx = ((br.xa + br.xb + 1) / 2) * T - 60, by = Y0 - 30;
+        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.fillRect(bx, by, 120, 12);
+        ctx.fillStyle = COLOR_HEX[opt.colors[br.side]];
+        ctx.fillRect(bx + 2, by + 2, 116 * Math.max(0, br.hp / br.maxHp), 4);
+        if (!br.done) {
+          ctx.fillStyle = "#f3e9c6";
+          ctx.fillRect(bx + 2, by + 7, 116 * (cols / len), 3);
+        }
+      }
     }
   }
 
@@ -682,7 +738,21 @@ export class Renderer {
       ctx.ellipse(x, y - 2, 16, 7, 0, 0, Math.PI * 2);
       ctx.stroke();
     }
-    ctx.drawImage(img, f * sz, 0, sz, sz, x - ax * s, y - ay * s, sz * s, sz * s);
+    // Đang bơi: chìm nửa người dưới mặt nước + gợn sóng
+    const swimming = w.m.ground[w.tile[i]] === WATER;
+    if (swimming) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(x - 120, y - 260, 240, 254);
+      ctx.clip();
+      ctx.drawImage(img, f * sz, 0, sz, sz, x - ax * s, y - ay * s + 16, sz * s, sz * s);
+      ctx.restore();
+      ctx.strokeStyle = "rgba(235,250,255,0.75)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(x, y - 6, 15, 5, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    } else ctx.drawImage(img, f * sz, 0, sz, sz, x - ax * s, y - ay * s, sz * s, sz * s);
     const max = [120, 70, 160, 60, 50][w.type[i]];
     if (w.hp[i] < max && w.type[i] !== PAWN) {
       ctx.fillStyle = "rgba(0,0,0,0.55)";

@@ -3,7 +3,7 @@ import { io } from "socket.io-client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Assets } from "@/lib/game/assets";
 import { UNIT_VI, colorPaths, staticPaths } from "@game/shared";
-import { COLORS, COLOR_HEX, COLOR_VI, FORD, MH, MW, SPEED_FORD, T, WATER, WORLD_H, WORLD_W, type TeamColor } from "@game/shared";
+import { COLOR_HEX, COLOR_VI, FORD, MAX_BUILT_BRIDGES, MH, MW, SPEED_FORD, SPEED_SWIM, T, WATER, WORLD_H, WORLD_W, type TeamColor } from "@game/shared";
 import { generateMap, passable } from "@game/shared";
 import { Renderer, type Camera, type ViewOptions } from "@/lib/game/renderer";
 import { World, AICommander, MOVE_ATTACK, MOVE_MARCH, OBJ_FLAG, OBJ_RIVER, PRESTIGE_WIN, STANCE_DEFEND, STANCE_PURSUE, TIME_LIMIT, type GameEvent, type WinReason } from "@game/shared";
@@ -41,6 +41,15 @@ interface Stats {
 }
 
 type Mode = "ai" | "pvp";
+// Lệnh chờ chuột phải kế tiếp: Tấn công (F) · Bơi qua sông (V) · Bắc cầu (B)
+type ArmMode = "attack" | "swim" | "bridge" | null;
+const ARM_HINT: Record<Exclude<ArmMode, null>, string> = {
+  attack: "Chuột phải vào đích để TẤN CÔNG — quân tự chọn chỗ đánh trong vùng 12 ô, không dàn trận",
+  swim: "Chuột phải vào bờ bên kia để BƠI QUA SÔNG (chậm, không đánh được khi đang bơi)",
+  bridge: "Chuột phải vào lòng sông (nước sâu) để BẮC CẦU",
+};
+const MINI_SIZES = [220, 340, 480];
+const MINI_ZOOMS = [1, 2, 4];
 const PLAYER = 0; // chế độ đánh với máy: người chơi luôn là phe Tây
 
 interface Hover {
@@ -57,15 +66,15 @@ function describeTile(w: World, i: number): Hover {
   const x = i % MW, y = Math.floor(i / MW);
   let label = "Đồng cỏ";
   let speed = "1.0x";
-  if (m.ground[i] === WATER) { label = "Nước sâu — không thể đi"; speed = "—"; }
+  if (m.ground[i] === WATER) { label = "Nước sâu — chỉ bơi được (lệnh Bơi, V)"; speed = `${SPEED_SWIM}x`; }
   else if (m.ground[i] === FORD) { label = "Bãi cạn"; speed = `${SPEED_FORD}x`; }
-  else if (m.ground[i] === 3) label = "Cầu gỗ (điểm nghẽn)";
+  else if (m.ground[i] === 3) label = w.builtBridges.some((b) => b.alive && x >= b.xa && x <= b.xb && y >= b.y0 && y <= b.y1) ? "Cầu tự xây (phá được)" : "Cầu gỗ (điểm nghẽn)";
   else if (m.block[i]) { label = "Công trình"; speed = "—"; }
   else if (m.cliff[i]) { label = "Vách đá — không thể leo"; speed = "—"; }
   else if (m.ramp[i]) label = `Dốc lên tầng ${m.level[i] + 1}`;
   else if (m.forest[i]) label = "Rừng phục kích (tàng hình)";
   else if (m.level[i]) label = `Cao nguyên tầng ${m.level[i]}`;
-  if (!passable(m, i)) speed = "—";
+  if (!passable(m, i) && m.ground[i] !== WATER) speed = "—";
   return { x, y, label, speed, level: m.level[i], zone: m.forest[i] };
 }
 
@@ -77,24 +86,76 @@ function clampCam(cam: Camera, vw: number, vh: number) {
   cam.y = Math.max(hh, Math.min(WORLD_H - hh, cam.y));
 }
 
-function drawMinimap(c: HTMLCanvasElement | null, cam: Camera, opt: ViewOptions, w: World, r: Renderer, vw: number, vh: number) {
+// Điểm giao chiến trên bản đồ nhỏ (gom theo ô lưới 16×16 ô bản đồ)
+interface Clash { x: number; y: number; n: number; own: boolean }
+const CLASH_CELL = 16;
+
+function findClashes(w: World, viewer: number): Clash[] {
+  const G = MW / CLASH_CELL;
+  const cnt = new Uint16Array(G * G), own = new Uint8Array(G * G);
+  const sx = new Float32Array(G * G), sy = new Float32Array(G * G);
+  const vc = w.visCount[viewer as 0 | 1];
+  for (let i = 0; i < w.n; i++) {
+    if (!w.alive[i] || w.time - w.lastCombat[i] > 1.5) continue;
+    const mine = w.side[i] === viewer;
+    if (!mine && vc[w.tile[i]] === 0) continue; // giao chiến của địch mà mình không thấy → không biết
+    const c = Math.floor(w.y[i] / T / CLASH_CELL) * G + Math.floor(w.x[i] / T / CLASH_CELL);
+    cnt[c]++; sx[c] += w.x[i]; sy[c] += w.y[i];
+    if (mine) own[c] = 1;
+  }
+  const out: Clash[] = [];
+  for (let c = 0; c < G * G; c++) if (cnt[c] >= 3) out.push({ x: sx[c] / cnt[c], y: sy[c] / cnt[c], n: cnt[c], own: !!own[c] });
+  return out.sort((p, q) => q.n - p.n);
+}
+
+// Vùng thế giới mà bản đồ nhỏ đang hiển thị (phóng to thì bám theo camera)
+function miniView(cam: Camera, zoom: number): [number, number, number] {
+  const span = WORLD_W / zoom;
+  const x0 = Math.max(0, Math.min(WORLD_W - span, cam.x - span / 2));
+  const y0 = Math.max(0, Math.min(WORLD_H - span, cam.y - span / 2));
+  return [x0, y0, span];
+}
+
+function drawMinimap(c: HTMLCanvasElement | null, cam: Camera, opt: ViewOptions, w: World, r: Renderer, vw: number, vh: number, zoom: number, clashes: Clash[], now: number) {
   if (!c) return;
   const g = c.getContext("2d")!;
   const S = c.width;
+  const [vx0, vy0, span] = miniView(cam, zoom);
+  const k = S / span; // px bản đồ nhỏ / px thế giới
+  const tx0 = vx0 / T, ty0 = vy0 / T, tspan = span / T;
   g.imageSmoothingEnabled = false;
-  g.drawImage(r.minimap, 0, 0, S, S);
+  g.fillStyle = "#1d3b44";
+  g.fillRect(0, 0, S, S);
+  g.drawImage(r.minimap, tx0, ty0, tspan, tspan, 0, 0, S, S);
   // Sương mù: phủ trước khi vẽ quân/công trình để chấm quân ta vẫn nổi rõ
   const fog = r.minimapFog(w, opt.viewer);
   if (fog) {
     g.save();
     g.imageSmoothingEnabled = true;
-    g.drawImage(fog, 0, 0, S, S);
+    g.drawImage(fog, tx0, ty0, tspan, tspan, 0, 0, S, S);
     g.restore();
   }
-  const k = S / WORLD_W;
+  const X = (x: number) => (x - vx0) * k, Y = (y: number) => (y - vy0) * k;
+  // cầu tự xây: phần đã lát đặc, phần còn lại viền đứt
+  for (const br of w.builtBridges) {
+    if (!br.alive) continue;
+    const c0 = w.bridgeCol(br, 0), c1 = w.bridgeCol(br, Math.max(0, br.built - 1));
+    const bh = (br.y1 - br.y0 + 1) * T * k;
+    g.fillStyle = "#a86e3c";
+    if (br.built > 0) g.fillRect(X(Math.min(c0, c1) * T), Y(br.y0 * T), (Math.abs(c1 - c0) + 1) * T * k, Math.max(1.5, bh));
+    if (!br.done) {
+      g.strokeStyle = "#e9c48f";
+      g.setLineDash([2, 2]);
+      g.lineWidth = 1;
+      g.strokeRect(X(br.xa * T), Y(br.y0 * T), (br.xb - br.xa + 1) * T * k, Math.max(1.5, bh));
+      g.setLineDash([]);
+    }
+  }
+  const dot = Math.max(1.5, Math.min(3, zoom * 1.2));
   for (let s = 0; s < 2; s++) {
     g.fillStyle = COLOR_HEX[opt.colors[s]];
-    for (let i = s; i < w.n; i += 6) {
+    const stride = zoom >= 2 ? 2 : 6;
+    for (let i = s; i < w.n; i += stride) {
       if (!w.alive[i] || w.side[i] !== s) continue;
       // Kiểm tra sương mù: ẩn quân địch ở ô chưa có tầm nhìn
       if (opt.viewer >= 0 && s !== opt.viewer) {
@@ -103,33 +164,53 @@ function drawMinimap(c: HTMLCanvasElement | null, cam: Camera, opt: ViewOptions,
       }
       // Kiểm tra rừng cây (cơ chế cũ)
       if (opt.viewer >= 0 && s !== opt.viewer && w.m.forest[w.tile[i]] && !w.presence[opt.viewer][w.m.forest[w.tile[i]]]) continue;
-      g.fillRect(w.x[i] * k, w.y[i] * k, 1.5, 1.5);
+      const px = X(w.x[i]), py = Y(w.y[i]);
+      if (px < -2 || py < -2 || px > S + 2 || py > S + 2) continue;
+      g.fillRect(px, py, dot, dot);
     }
   }
   for (const b of w.m.buildings) {
     if (b.hp <= 0) continue;
     g.fillStyle = COLOR_HEX[opt.colors[b.side]];
     g.strokeStyle = "#1b1b1b";
-    g.fillRect(b.tx * T * k - 1, b.ty * T * k - 1, b.fw * T * k + 2, b.fh * T * k + 2);
+    g.fillRect(X(b.tx * T) - 1, Y(b.ty * T) - 1, b.fw * T * k + 2, b.fh * T * k + 2);
+    g.lineWidth = 1;
+    g.strokeRect(X(b.tx * T) - 1, Y(b.ty * T) - 1, b.fw * T * k + 2, b.fh * T * k + 2);
   }
   // Mục tiêu: màu theo chủ sở hữu mà người xem biết (cập nhật khi có tầm nhìn)
-  const kt = S / MW;
   for (const o of w.obj) {
     const owner = opt.objKnown ? opt.objKnown[o.id] : w.objOwner[o.id];
-    const x = (o.tx + 0.5) * kt, y = (o.ty + 0.5) * kt, r = o.kind === OBJ_RIVER ? 5 : 4;
+    const x = X((o.tx + 0.5) * T), y = Y((o.ty + 0.5) * T), rr = (o.kind === OBJ_RIVER ? 5 : 4) * Math.min(1.6, Math.sqrt(zoom));
     g.fillStyle = owner >= 0 ? COLOR_HEX[opt.colors[owner]] : "#f3e9c6";
     g.strokeStyle = "#1b1b1b";
     g.lineWidth = 1.2;
     g.beginPath();
-    if (o.kind === OBJ_RIVER) { g.moveTo(x, y - r); g.lineTo(x + r, y); g.lineTo(x, y + r); g.lineTo(x - r, y); }
-    else { g.moveTo(x - r * 0.6, y + r); g.lineTo(x - r * 0.6, y - r); g.lineTo(x + r, y - r * 0.4); g.lineTo(x - r * 0.6, y + r * 0.1); }
+    if (o.kind === OBJ_RIVER) { g.moveTo(x, y - rr); g.lineTo(x + rr, y); g.lineTo(x, y + rr); g.lineTo(x - rr, y); }
+    else { g.moveTo(x - rr * 0.6, y + rr); g.lineTo(x - rr * 0.6, y - rr); g.lineTo(x + rr, y - rr * 0.4); g.lineTo(x - rr * 0.6, y + rr * 0.1); }
     g.closePath();
     g.fill();
     g.stroke();
   }
+  // Tín hiệu giao chiến: vòng đỏ nhấp nháy (đỏ đậm = quân ta đang đánh, cam = địch đánh nhau trong tầm nhìn)
+  const pulse = (now / 700) % 1;
+  for (const cl of clashes) {
+    const x = X(cl.x), y = Y(cl.y);
+    const base = 4 + Math.min(8, Math.sqrt(cl.n));
+    g.strokeStyle = cl.own ? `rgba(255,60,40,${1 - pulse})` : `rgba(255,170,40,${1 - pulse})`;
+    g.lineWidth = 2;
+    g.beginPath();
+    g.arc(x, y, base + pulse * 10, 0, Math.PI * 2);
+    g.stroke();
+    g.fillStyle = cl.own ? "#ff3c28" : "#ffaa28";
+    g.beginPath();
+    g.moveTo(x - 3, y - 3); g.lineTo(x + 3, y + 3); g.moveTo(x + 3, y - 3); g.lineTo(x - 3, y + 3);
+    g.strokeStyle = g.fillStyle;
+    g.lineWidth = 1.6;
+    g.stroke();
+  }
   g.strokeStyle = "#fff6c8";
   g.lineWidth = 1.5;
-  g.strokeRect((cam.x - vw / 2 / cam.zoom) * k, (cam.y - vh / 2 / cam.zoom) * k, (vw / cam.zoom) * k, (vh / cam.zoom) * k);
+  g.strokeRect(X(cam.x - vw / 2 / cam.zoom), Y(cam.y - vh / 2 / cam.zoom), (vw / cam.zoom) * k, (vh / cam.zoom) * k);
 }
 
 export default function BattleMap() {
@@ -147,12 +228,14 @@ export default function BattleMap() {
   const modeRef = useRef<Mode | null>(null);
   const aiRef = useRef<AICommander | null>(null);
   const mapRef = useRef<GameMap | null>(null);
-  const armedRef = useRef(false);          // F: lệnh chuột phải kế tiếp là Tấn công
+  const armRef = useRef<ArmMode>(null);    // lệnh chuột phải kế tiếp (F/V/B)
+  const clashRef = useRef<Clash[]>([]);    // điểm giao chiến cho bản đồ nhỏ
+  const miniZoomRef = useRef(1);
   const knownRef = useRef<Int8Array | null>(null); // chủ sở hữu mục tiêu phe mình biết
 
   const [seed, setSeed] = useState(12345);
   const [loading, setLoading] = useState<{ label: string; pct: number } | null>({ label: "Đang tải tài nguyên…", pct: 0 });
-  const [viewer, setViewer] = useState(0);
+  const [viewer, setViewer] = useState(0); // luôn là góc nhìn phe mình (đã bỏ Toàn cảnh / Tây / Đông)
   const [colors, setColors] = useState<[TeamColor, TeamColor]>(["Blue", "Red"]);
   const [showClouds, setShowClouds] = useState(true);
   const [showNav, setShowNav] = useState(false);
@@ -164,16 +247,29 @@ export default function BattleMap() {
   const [showLeftUI, setShowLeftUI] = useState(true);
   const [showRightUI, setShowRightUI] = useState(true);
   const [showMinimap, setShowMinimap] = useState(true);
+  const [miniSize, setMiniSize] = useState(0);
+  const [miniZoom, setMiniZoom] = useState(0);
+  const [showMiniLegend, setShowMiniLegend] = useState(false);
+  const [clashCount, setClashCount] = useState(0);
+  const [notice, setNotice] = useState<{ text: string; t: number } | null>(null);
   const [focusType, setFocusType] = useState<number | null>(null);
   const [focusIdx, setFocusIdx] = useState<number>(0);
   const [mode, setMode] = useState<Mode | null>(null);
   const [showHelp, setShowHelp] = useState(false);
-  const [armed, setArmed] = useState(false);
+  const [arm, setArmState] = useState<ArmMode>(null);
   const [hideVictory, setHideVictory] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
   const [focusGroupId, setFocusGroupId] = useState(-1);
   const cycleGroupRef = useRef<() => void>(() => {});
-  const setArmedBoth = useCallback((v: boolean) => { armedRef.current = v; setArmed(v); }, []);
+  const setArm = useCallback((v: ArmMode) => { armRef.current = v; setArmState(v); }, []);
+  const toggleArm = useCallback((v: Exclude<ArmMode, null>) => setArm(armRef.current === v ? null : v), [setArm]);
+  const say = useCallback((text: string) => setNotice({ text, t: performance.now() }), []);
+  useEffect(() => { miniZoomRef.current = MINI_ZOOMS[miniZoom]; }, [miniZoom]);
+  useEffect(() => {
+    if (!notice) return;
+    const h = setTimeout(() => setNotice(null), 3500);
+    return () => clearTimeout(h);
+  }, [notice]);
 
   const handleStartDeployment = useCallback((layout: { type: number, px: number, py: number }[]) => {
     if (!mapRef.current) return;
@@ -344,7 +440,7 @@ export default function BattleMap() {
       r.dpr = dpr;
       r.render(ctx, w, cam, vw, vh, optRef.current, w.time + acc, boxRef.current, hoverRef.current, dt);
 
-      drawMinimap(miniRef.current, cam, optRef.current, w, r, vw, vh);
+      drawMinimap(miniRef.current, cam, optRef.current, w, r, vw, vh, miniZoomRef.current, clashRef.current, now);
       statT += dt;
       if (statT > 0.25) {
         statT = 0;
@@ -381,9 +477,11 @@ export default function BattleMap() {
           events: [...w.events],
           time: w.time,
           stance,
-          ai: aiRef.current && optRef.current.viewer !== PLAYER ? [...aiRef.current.status(), "—", ...aiRef.current.log.slice(-5)] : [],
+          ai: [],
         });
         setZoomPct(Math.round(cam.zoom * 100));
+        clashRef.current = findClashes(w, optRef.current.viewer >= 0 ? optRef.current.viewer : PLAYER);
+        setClashCount(clashRef.current.filter((c) => c.own).length);
       }
     };
     raf = requestAnimationFrame(loop);
@@ -401,9 +499,11 @@ export default function BattleMap() {
       const key = e.key.toLowerCase();
       if (e.key >= "1" && e.key <= "5") w.selectType(+e.key - 1, side);
       if (key === "q") w.selectType(-1, side);
-      if (e.key === "Escape") { w.sel.fill(0); setArmedBoth(false); }
+      if (e.key === "Escape") { w.sel.fill(0); setArm(null); }
       if (key === "h") w.orderHold(w.selected());
-      if (key === "f") setArmedBoth(!armedRef.current);
+      if (key === "f") toggleArm("attack");
+      if (key === "v") toggleArm("swim");
+      if (key === "b") toggleArm("bridge");
       if (key === "t") toggleStance(w);
       if (key === "g") w.orderRally(w.selected());
       if (key === "tab") {
@@ -421,7 +521,7 @@ export default function BattleMap() {
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
     return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
-  }, [setArmedBoth]);
+  }, [setArm, toggleArm]);
 
   const drag = useRef<{ mode: "select" | "pan" | "right"; sx: number; sy: number; cx: number; cy: number; moved: boolean } | null>(null);
   const toWorld = (sx: number, sy: number) => {
@@ -475,15 +575,31 @@ export default function BattleMap() {
       w.selectRect(ax - pad, ay - pad, bx + pad, by + pad, side, e.shiftKey);
     } else if (d.mode === "right") {
       const [wx, wy] = toWorld(sx, sy);
-      const sel = w.selected();
-      if (sel.length) {
-        // Chuột phải = Hành quân (bỏ qua địch, dùng để rút); F rồi chuột phải / Alt + chuột phải = Tấn công
-        const attack = armedRef.current || e.altKey;
-        w.orderMove(sel, Math.floor(wx / T), Math.floor(wy / T), attack ? MOVE_ATTACK : MOVE_MARCH);
-        w.addFx(0, wx, wy, 0); // 0 = FX_DUST
-        if (armedRef.current) setArmedBoth(false);
-      }
+      issueOrder(wx, wy, e.altKey);
     }
+  };
+  // Chuột phải (trên bản đồ lớn hoặc bản đồ nhỏ) = Hành quân; F → Tấn công; V → Bơi qua sông; B → Bắc cầu
+  const issueOrder = (wx: number, wy: number, alt: boolean) => {
+    const w = worldRef.current;
+    if (!w) return;
+    const sel = w.selected();
+    if (!sel.length) return;
+    const tx = Math.floor(wx / T), ty = Math.floor(wy / T);
+    const mode = armRef.current;
+    if (mode === "bridge") {
+      const err = w.orderBuildBridge(sel, tx, ty);
+      if (err) { say(err); return; }
+      say("Đang bắc cầu — thợ tới bờ rồi lát dần từng cột. Địch có thể phá cầu.");
+    } else if (mode === "swim") {
+      w.orderMove(sel, tx, ty, MOVE_ATTACK, true, true);
+    } else if (mode === "attack" || alt) {
+      // Tấn công: không dàn trận — quanh điểm bấm là vùng chiến đấu, lính tự chọn chỗ đánh
+      w.orderMove(sel, tx, ty, MOVE_ATTACK, false, true);
+    } else {
+      w.orderMove(sel, tx, ty, MOVE_MARCH);
+    }
+    w.addFx(0, wx, wy, 0); // 0 = FX_DUST
+    if (mode) setArm(null);
   };
   useEffect(() => {
     const c = canvasRef.current!;
@@ -502,11 +618,40 @@ export default function BattleMap() {
     return () => c.removeEventListener("wheel", onWheel);
   }, []);
 
-  const miniNav = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (e.type === "pointermove" && e.buttons !== 1) return;
+  // Bản đồ nhỏ: chuột trái (kéo) = dời camera · chuột phải = ra lệnh cho quân đang chọn · lăn chuột = phóng to/thu nhỏ
+  const miniToWorld = (e: React.PointerEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>): [number, number] => {
     const rect = e.currentTarget.getBoundingClientRect();
-    camRef.current.x = ((e.clientX - rect.left) / rect.width) * WORLD_W;
-    camRef.current.y = ((e.clientY - rect.top) / rect.height) * WORLD_H;
+    const [x0, y0, span] = miniView(camRef.current, miniZoomRef.current);
+    return [x0 + ((e.clientX - rect.left) / rect.width) * span, y0 + ((e.clientY - rect.top) / rect.height) * span];
+  };
+  const miniNav = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.type === "pointerdown" && e.button === 2) {
+      const [wx, wy] = miniToWorld(e);
+      issueOrder(wx, wy, e.altKey);
+      return;
+    }
+    if (e.type === "pointermove" ? e.buttons !== 1 : e.button !== 0) return;
+    const [wx, wy] = miniToWorld(e);
+    camRef.current.x = wx;
+    camRef.current.y = wy;
+    camRef.current.targetX = undefined;
+    camRef.current.targetY = undefined;
+  };
+  useEffect(() => {
+    const c = miniRef.current;
+    if (!c) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      setMiniZoom((z) => Math.max(0, Math.min(MINI_ZOOMS.length - 1, z + (e.deltaY < 0 ? 1 : -1))));
+    };
+    c.addEventListener("wheel", onWheel, { passive: false });
+    return () => c.removeEventListener("wheel", onWheel);
+  }, [showMinimap, miniSize]);
+  const jumpToClash = () => {
+    const c = clashRef.current.find((x) => x.own) ?? clashRef.current[0];
+    if (!c) return;
+    camRef.current.targetX = c.x;
+    camRef.current.targetY = c.y;
   };
   const zoomTo = (z: number) => { camRef.current.zoom = z; };
 
@@ -559,12 +704,6 @@ export default function BattleMap() {
           <button className="ts-btn mb-2 w-full text-sm" onClick={() => setShowHelp(true)}>
             <img src={`${UI}/Icons/Icon_01.png`} alt="" className="h-6 w-6" /> Hướng dẫn &amp; luật thắng
           </button>
-          <Label>{mode === "ai" ? "Góc nhìn (Toàn cảnh = xem AI để thử nghiệm)" : "Góc nhìn (tầm nhìn rừng)"}</Label>
-          <div className="mb-2 grid grid-cols-3 gap-1">
-            {[[0, "Tây"], [-1, "Toàn cảnh"], [1, "Đông"]].map(([v, l]) => (
-              <button key={v} className="ts-btn text-xs" data-on={viewer === v} onClick={() => setViewer(v as number)}>{l}</button>
-            ))}
-          </div>
           <div className="mb-2">
             <Label>Đơn vị quân đội</Label>
             <div className="grid grid-cols-3 gap-1">
@@ -601,9 +740,6 @@ export default function BattleMap() {
           <button className="ts-btn text-sm" data-on={showClouds} onClick={() => setShowClouds(!showClouds)}>
             <img src={`${UI}/Icons/Icon_12.png`} alt="" className="h-6 w-6" /> Mây trời
           </button>
-          <button className="ts-btn text-sm" data-on={showMinimap} onClick={() => setShowMinimap(!showMinimap)}>
-            <img src={`${UI}/Icons/Icon_07.png`} alt="" className="h-6 w-6" /> Bản đồ con
-          </button>
           <button className="ts-btn text-sm" onClick={() => { setLoading({ label: "Đang sinh bản đồ mới…", pct: 0.5 }); setSeed((s) => (s * 16807) % 2147483647); }}>
             <img src={`${UI}/Icons/Icon_10.png`} alt="" className="h-6 w-6" /> Bản đồ mới
           </button>
@@ -614,7 +750,7 @@ export default function BattleMap() {
           </div>
         </div>
           <div className="mt-2 text-[11px] leading-snug opacity-80">
-            Kéo chuột trái: chọn quân · <b>Chuột phải: Hành quân</b> (bỏ qua địch, dùng để rút) · <b>F rồi chuột phải</b> (hoặc Alt + chuột phải): Tấn công · T: Phòng thủ/Truy kích · G: Quay đầu · H: Giữ vị trí · 1–5: chọn binh chủng · Q: cả đạo quân · WASD / kéo chuột phải: di chuyển camera
+            Kéo chuột trái: chọn quân · <b>Chuột phải: Hành quân</b> (bỏ qua địch, dùng để rút) · <b>F rồi chuột phải</b> (hoặc Alt + chuột phải): Tấn công · <b>V</b>: Bơi qua sông · <b>B</b>: Bắc cầu · T: Phòng thủ/Truy kích · G: Quay đầu · H: Giữ vị trí · 1–5: chọn binh chủng · Q: cả đạo quân · WASD / kéo chuột phải: di chuyển camera
           </div>
         </div>
       )}
@@ -630,7 +766,8 @@ export default function BattleMap() {
           <Legend color="#2c5c34" name="Rừng phục kích" note="1.0x · tàng hình" />
           <Legend color="#8ccdbe" name="Bãi cạn" note={`${SPEED_FORD}x`} />
           <Legend color="#a86e3c" name="Cầu (3 cầu)" note="1.0x · nút thắt" />
-          <Legend color="#47aba9" name="Nước sâu" note="chặn" />
+          <Legend color="#47aba9" name="Nước sâu" note={`bơi ${SPEED_SWIM}x (V)`} />
+          <Legend color="#b87a48" name={`Cầu tự xây (tối đa ${MAX_BUILT_BRIDGES})`} note="B · phá được" />
           <Legend color="#556e73" name="Vách đá" note="chặn" />
           <Legend color="#c8be6e" name="Dốc lên cao nguyên" note="lối duy nhất" />
           <Legend color="#96b946" name="Cao nguyên 1–3 tầng" note="+2 tầm cung" />
@@ -669,10 +806,52 @@ export default function BattleMap() {
         </div>
       )}
 
-      {/* ---- bottom-right: minimap */}
-      {showMinimap && (
-        <div className="ts-banner absolute bottom-2 right-2">
-          <canvas ref={miniRef} width={220} height={220} className="block h-[220px] w-[220px] [image-rendering:pixelated]" onPointerDown={miniNav} onPointerMove={miniNav} />
+      {/* ---- bottom-right: bản đồ nhỏ (thao tác ngay trên bản đồ: phóng to, đổi cỡ, chú thích, ẩn) */}
+      {showMinimap ? (
+        <div className="absolute bottom-2 right-2">
+          <div className="ts-banner flex flex-col">
+            <div className="mb-1 flex items-center gap-1 text-[11px] text-[var(--ink)]">
+              <span className="ts-title mr-auto text-sm">Bản đồ</span>
+              {clashCount > 0 && (
+                <button className="ts-btn ts-sm red ts-pulse" title="Quân ta đang giao chiến — bấm để nhảy tới" onClick={jumpToClash}>⚔ {clashCount}</button>
+              )}
+              <button className="ts-btn ts-sm" title="Thu nhỏ (lăn chuột trên bản đồ)" disabled={miniZoom === 0} onClick={() => setMiniZoom((z) => Math.max(0, z - 1))}>−</button>
+              <span className="w-6 text-center tabular-nums">{MINI_ZOOMS[miniZoom]}x</span>
+              <button className="ts-btn ts-sm" title="Phóng to quanh camera" disabled={miniZoom === MINI_ZOOMS.length - 1} onClick={() => setMiniZoom((z) => Math.min(MINI_ZOOMS.length - 1, z + 1))}>+</button>
+              <button className="ts-btn ts-sm" title="Đổi cỡ khung bản đồ" onClick={() => setMiniSize((z) => (z + 1) % MINI_SIZES.length)}>⤢</button>
+              <button className="ts-btn ts-sm" data-on={showMiniLegend} title="Chú thích ký hiệu" onClick={() => setShowMiniLegend(!showMiniLegend)}>?</button>
+              <button className="ts-btn ts-sm" title="Ẩn bản đồ" onClick={() => setShowMinimap(false)}>✕</button>
+            </div>
+            <div className="relative">
+            {showMiniLegend && <MiniLegend colors={colors} onClose={() => setShowMiniLegend(false)} />}
+            <canvas
+              key={miniSize}
+              ref={miniRef}
+              width={MINI_SIZES[miniSize]}
+              height={MINI_SIZES[miniSize]}
+              style={{ width: `min(${MINI_SIZES[miniSize]}px, 70vw, 60vh)`, height: `min(${MINI_SIZES[miniSize]}px, 70vw, 60vh)` }}
+              className="block cursor-crosshair [image-rendering:pixelated]"
+              onPointerDown={miniNav}
+              onPointerMove={miniNav}
+              onContextMenu={(e) => e.preventDefault()}
+            />
+            </div>
+            <div className="mt-0.5 text-[10px] leading-tight text-[var(--ink)] opacity-75">Trái: dời camera · Phải: ra lệnh · Lăn: phóng to</div>
+          </div>
+        </div>
+      ) : (
+        <div className="absolute bottom-2 right-2">
+          <button className="ts-btn text-xs px-2 py-1" onClick={() => setShowMinimap(true)}>
+            Bản đồ{clashCount > 0 ? ` · ⚔ ${clashCount}` : ""}
+          </button>
+        </div>
+      )}
+
+      {/* ---- lệnh đang chờ chuột phải & thông báo */}
+      {(arm || notice) && (
+        <div className="pointer-events-none absolute left-1/2 top-[248px] flex -translate-x-1/2 flex-col items-center gap-1">
+          {arm && <div className="rounded bg-black/70 px-3 py-1 text-[12px] font-semibold text-[#ffd76a]">{ARM_HINT[arm]} · Esc để huỷ</div>}
+          {notice && <div className="rounded bg-[#3b2416]/90 px-3 py-1 text-[12px] font-semibold text-white">{notice.text}</div>}
         </div>
       )}
 
@@ -692,7 +871,7 @@ export default function BattleMap() {
               Tư thế: <b>{stats.stance[2] >= stats.stance[0] && stats.stance[2] >= stats.stance[1] ? "Giữ vị trí" : stats.stance[1] > stats.stance[0] ? "Truy kích" : "Phòng thủ"}</b>
             </div>
             <div className="grid grid-cols-2 gap-1">
-              <button className="ts-btn red !min-h-[36px] text-[11px]" data-on={armed} onClick={() => setArmedBoth(!armed)}>{armed ? "Chọn đích…" : "Tấn công (F)"}</button>
+              <button className="ts-btn red !min-h-[36px] text-[11px]" data-on={arm === "attack"} onClick={() => toggleArm("attack")}>{arm === "attack" ? "Chọn đích…" : "Tấn công (F)"}</button>
               <button className="ts-btn !min-h-[36px] text-[11px]" onClick={() => {
                 const w = worldRef.current; if (!w) return;
                 const sel = w.selected();
@@ -700,17 +879,11 @@ export default function BattleMap() {
               }}>{stats.stance[1] * 2 < selTotal ? "Truy kích (T)" : "Phòng thủ (T)"}</button>
               <button className="ts-btn !min-h-[36px] text-[11px]" onClick={() => { const w = worldRef.current; if (w) w.orderRally(w.selected()); }}>Quay đầu (G)</button>
               <button className="ts-btn !min-h-[36px] text-[11px]" onClick={() => { const w = worldRef.current; if (w) w.orderHold(w.selected()); }}>Giữ (H)</button>
+              <button className="ts-btn !min-h-[36px] text-[11px]" data-on={arm === "swim"} title={`Bơi thẳng qua nước sâu: ${SPEED_SWIM}x tốc độ, nhận +50% sát thương, không đánh được khi đang bơi`} onClick={() => toggleArm("swim")}>{arm === "swim" ? "Chọn bờ…" : "Bơi qua sông (V)"}</button>
+              <button className="ts-btn !min-h-[36px] text-[11px]" data-on={arm === "bridge"} title={`Bắc cầu mới qua sông (mỗi phe tối đa ${MAX_BUILT_BRIDGES}). Cầu phụ không tính là đầu cầu.`} onClick={() => toggleArm("bridge")}>{arm === "bridge" ? "Chọn chỗ…" : "Bắc cầu (B)"}</button>
             </div>
-            <div className="text-[10px] opacity-70">{armed ? "Chuột phải vào đích để tấn công" : "Chuột phải = hành quân (bỏ qua địch)"}</div>
+            <div className="text-[10px] opacity-70">{arm ? ARM_HINT[arm] : "Chuột phải = hành quân (bỏ qua địch)"}</div>
           </div>
-        </div>
-      )}
-
-      {/* ---- AI debug (chỉ khi xem Toàn cảnh / phe Đông) */}
-      {mode === "ai" && stats && stats.ai.length > 0 && (
-        <div className="absolute bottom-[240px] right-2 w-[300px] rounded bg-black/70 p-2 text-[11px] leading-snug text-[#f3e9c6]">
-          <div className="mb-1 font-bold text-[#ffd76a]">Chỉ huy máy (phe Đông) — chế độ thử nghiệm</div>
-          {stats.ai.map((l, k) => <div key={k}>{l}</div>)}
         </div>
       )}
 
@@ -775,6 +948,35 @@ export default function BattleMap() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// Chú thích ký hiệu trên bản đồ nhỏ
+function Row({ icon, name }: { icon: React.ReactNode; name: string }) {
+  return <div className="flex items-center gap-2 py-[1px]"><span className="inline-flex w-5 justify-center">{icon}</span><span>{name}</span></div>;
+}
+
+function MiniLegend({ colors, onClose }: { colors: [TeamColor, TeamColor]; onClose: () => void }) {
+  const sq = (c: string, cls = "h-2 w-2") => <span className={`inline-block ${cls} border border-black/40`} style={{ background: c }} />;
+  return (
+    <div className="absolute inset-0 z-10 overflow-auto rounded bg-[#f3e9c6]/95 p-2 text-[10.5px] leading-tight text-[var(--ink)] shadow">
+      <div className="ts-title mb-1 flex items-center justify-between text-sm"><span>Chú thích</span><button className="ts-btn ts-sm" onClick={onClose}>✕</button></div>
+      <Row icon={sq(COLOR_HEX[colors[0]], "h-1.5 w-1.5")} name="Quân ta" />
+      <Row icon={sq(COLOR_HEX[colors[1]], "h-1.5 w-1.5")} name="Quân địch (chỉ khi đang thấy)" />
+      <Row icon={sq(COLOR_HEX[colors[0]], "h-2.5 w-3")} name="Công trình (màu phe)" />
+      <Row icon={<span style={{ color: "#f3e9c6", textShadow: "0 0 1px #000" }}>◆</span>} name="Cứ điểm sông (màu phe giữ)" />
+      <Row icon={<span style={{ color: "#f3e9c6", textShadow: "0 0 1px #000" }}>⚑</span>} name="Cờ nội địa" />
+      <Row icon={<span className="font-bold text-[#ff3c28]">⚔</span>} name="Quân ta đang giao chiến" />
+      <Row icon={<span className="font-bold text-[#ffaa28]">⚔</span>} name="Địch giao chiến (trong tầm nhìn)" />
+      <Row icon={sq("#a86e3c", "h-1.5 w-3")} name="Cầu gỗ / cầu tự xây" />
+      <Row icon={<span className="inline-block h-1.5 w-3 border border-dashed border-[#e9c48f]" />} name="Cầu đang xây" />
+      <Row icon={sq("#47aba9")} name="Nước sâu (bơi được, V)" />
+      <Row icon={sq("#8ccdbe")} name="Bãi cạn" />
+      <Row icon={sq("#2c5c34")} name="Rừng phục kích" />
+      <Row icon={sq("#96b946")} name="Cao nguyên" />
+      <Row icon={<span className="inline-block h-2 w-3 border border-[#fff6c8] bg-black/30" />} name="Vùng camera đang nhìn" />
+      <Row icon={<span className="inline-block h-2 w-3 bg-black/60" />} name="Sương mù (chưa thấy)" />
     </div>
   );
 }

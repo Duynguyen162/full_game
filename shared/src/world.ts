@@ -8,12 +8,15 @@ import {
   SCOUT_BLIND_T, SPAWN_W, STANCE_DEFEND, STANCE_PURSUE, SURRENDER_FRAC, T, TIME_LIMIT, TOWER_CD, TOWER_DMG, TOWER_RANGE,
   WORLD_H, WORLD_W, type Side,
   RIVER_PRESTIGE_RATE, FLAG_BRIDGEHEAD_RATE, FLAG_ISOLATE_T, REAR_DMG_NO_BRIDGE,
+  WATER, BRIDGE, SWIM_TAKEN, MAX_BUILT_BRIDGES, BRIDGE_ROWS_BUILT, BRIDGE_MAX_LEN, BRIDGE_COL_WORK, BRIDGE_CREW_CAP,
+  BRIDGE_HP_PER_COL, BRIDGE_BASE_HP,
   FLAG_HOME_HEAL_R, FLAG_HOME_HEAL_RATE, FLAG_HOME_REST_T,
   DEPOT_SCHEDULE, DEPOT_WARN_T, DEPOT_VALUE, DEPOT_CAP_T, DEPOT_CAP_R, DEPOT_EXPIRE_T,
 } from "./constants";
 import { OBJ_FLAG, OBJ_RIVER, FRONT_MID, buildObjectives, type Objective } from "./objectives";
 import { DIR_GOAL, DIR_NONE, DX, DY, buildFlowField, invalidateNav, navMask, nearestPassable, type FlowField } from "./flowfield";
 import { canStep, passable, tileSpeed, type Building, type GameMap } from "./map";
+import { FORM_SPACING, SlotClaims, buildLocalNav, lineWalkable, stepTiles, navCell, navReached, planFormation, squareFit, type LocalNav } from "./formation";
 import { mulberry32 } from "./rng";
 
 // ---- Tính sẵn mặt nạ tầm nhìn hình tròn cho bán kính 1..20 (tính 1 lần lúc khởi động)
@@ -77,6 +80,22 @@ export const FX_SPLASH = 2;
 export const FX_HEAL = 3;
 export interface Fx { k: number; x: number; y: number; t0: number; v: number }
 export interface GameEvent { t: number; side: number; text: string }
+
+// Cầu tự xây: lát dần từng cột ngang sông. Chỉ để đánh úp — KHÔNG tính là chỗ vượt sông / đầu cầu.
+export interface BuiltBridge {
+  id: number;
+  side: number;
+  y0: number; y1: number;  // các hàng ô của cầu
+  xa: number; xb: number;  // cột nước đầu/cuối (gồm cả hai)
+  dir: 1 | -1;             // hướng lát: 1 = từ tây sang đông
+  built: number;           // số cột đã lát xong
+  work: number;            // công đã góp cho cột đang lát
+  hp: number;
+  maxHp: number;
+  alive: boolean;          // false = đã bị phá
+  done: boolean;
+}
+export const BRIDGE_TARGET = 10000; // btarget >= BRIDGE_TARGET: đang nhắm cầu tự xây (BRIDGE_TARGET + id)
 export type WinReason = "prestige" | "castle" | "surrender" | "time";
 export const MOVE_ATTACK = 0;
 export const MOVE_MARCH = 1;
@@ -84,6 +103,19 @@ export const MOVE_MARCH = 1;
 const MAX_ARROWS = 8000;
 const MAX_FX = 900;
 const MAX_FIELDS = 40;
+const MAX_NAVS = 64; // số nav cục bộ (chặng cuối tới ô đội hình) giữ đồng thời
+const ENGAGE_R = 160;
+// Ưu tiên mục tiêu (px trừ vào khoảng cách) — xem findEnemy
+const PRI_ATTACKER = 48, PRI_ARCHER = 16, PRI_LOWHP = 24, PRI_MAX = PRI_ATTACKER + PRI_ARCHER + PRI_LOWHP;
+// Thời gian vung vũ khí tới lúc trúng (giây) — sát thương áp đúng "khoảnh khắc trúng đòn" của hoạt ảnh
+const WINDUP = [0.2, 0, 0.25, 0, 0.2]; // kiếm sĩ, cung thủ (tên bay riêng), thương kỵ, tu sĩ (hồi máu ngay), trinh sát
+// Vùng chiến đấu: lệnh Tấn công (F) và tiếp viện khi quân ta bị đánh — trong vùng lính tự chọn chỗ đánh,
+// không bị dây xích Phòng thủ neo vào chỗ đứng, đánh xong thì dừng tại chỗ (không quay về xếp hàng).
+const ZONE_ATTACK_R = 12;   // ô: bán kính vùng của lệnh Tấn công
+const ZONE_CALL_R = 10;     // ô: bán kính vùng tiếp viện quanh chỗ bị đánh
+const ZONE_CALL_T = 6;      // giây: vùng tiếp viện tự tắt sau chừng này giây không còn giao chiến
+const CALL_CELL = 8;        // ô: lưới gom "chỗ đang bị đánh"
+const RANGE_HYST = 10; // px: đang đánh thì cho lệch thêm chừng này mới chuyển sang đuổi (chống rung ở mép tầm) // px: lính cận chiến trong bán kính này mới tính là "đang vây đánh" mục tiêu (gồm cả lính sắp tới)
 const SEP = 24; // separation radius (px) - hẹp lại để lính xếp hàng dọc thay vì tràn ngang
 
 export class World {
@@ -114,6 +146,32 @@ export class World {
   formDY = new Float32Array(CAP);
   formTargetX = new Float32Array(CAP);
   formTargetY = new Float32Array(CAP);
+  formNav = new Int16Array(CAP).fill(-1); // chỉ số trong navs (-1 = không có)
+  formNavId = new Int32Array(CAP);         // id nav lúc nhận lệnh (nav bị ghi đè thì không khớp)
+  formBest = new Float32Array(CAP);        // khoảng cách gần ô nhất đã đạt (đo tiến triển chặng cuối)
+  stallX = new Float32Array(CAP);          // vị trí mốc để phát hiện giằng co (di chuyển mà không đi đâu)
+  stallY = new Float32Array(CAP);
+  stallT = new Float32Array(CAP);
+  lastHitBy = new Int32Array(CAP).fill(-1);
+  hitAt = new Float32Array(CAP);                  // đòn cận chiến đang vung: thời điểm trúng
+  hitTg = new Int32Array(CAP).fill(-1);           // …mục tiêu (lính ≥ 0, công trình/cầu = −2 − bt, −1 = không có)
+  hitDmg = new Float32Array(CAP);
+  lastHitT = new Float32Array(CAP).fill(-100);    // lần cuối bị trúng đòn
+  zoneX = new Float32Array(CAP);                  // tâm vùng chiến đấu (px)
+  zoneY = new Float32Array(CAP);
+  zoneR = new Float32Array(CAP);                  // bán kính (px), 0 = không có vùng
+  zoneUntil = new Float32Array(CAP);              // hết hạn (Infinity = vùng của lệnh Tấn công)
+  private _hitCells: [Uint8Array, Uint8Array] = [
+    new Uint8Array((MW / CALL_CELL) * (MH / CALL_CELL)), new Uint8Array((MW / CALL_CELL) * (MH / CALL_CELL)),
+  ];       // lính địch vừa đánh mình (để biết bị đánh từ trước hay sau)
+  lastTargetT = new Float32Array(CAP).fill(-100); // lần cuối có mục tiêu (để không kéo lính về chỗ cũ giữa trận)
+  formDirect = new Uint8Array(CAP);        // 1 = đã thấy đường thẳng tới ô, đang đi thẳng vào ô
+  formWp = new Int32Array(CAP).fill(-1);   // ô dẫn đường (trên đường ngắn nhất tâm khối → ô), -1 = chưa có
+  formNoShort = new Float32Array(CAP);     // tới thời điểm này: không đi tắt, chỉ bám đường tìm được (gỡ giằng co)
+  swim = new Uint8Array(CAP);              // 1 = có lệnh Bơi qua sông (được xuống nước sâu)
+  buildTask = new Int16Array(CAP).fill(-1); // id cầu tự xây đang được giao lát (-1 = không)
+  builtBridges: BuiltBridge[] = [];
+  private bridgeCrew: number[] = [];
   // ---- Lệnh di chuyển, tư thế, rút lui & truy kích
   moveMode   = new Uint8Array(CAP);    // MOVE_ATTACK | MOVE_MARCH (hành quân = bỏ qua địch, dùng để rút)
   stance     = new Uint8Array(CAP);    // STANCE_DEFEND (đuổi tối đa LEASH_R ô) | STANCE_PURSUE
@@ -173,6 +231,8 @@ export class World {
     { gold: 0, wood: 0, meat: 0 },
   ];
   fields: (FlowField | null)[] = new Array(MAX_FIELDS).fill(null);
+  navs: (LocalNav | null)[] = new Array(MAX_NAVS).fill(null);
+  private navRing = 0;
   // arrows
   arN = 0;
   arX0 = new Float32Array(MAX_ARROWS);
@@ -272,28 +332,26 @@ export class World {
   }
 
   // Continuous movement across a tile edge; a diagonal crossing is allowed via either neighbour.
-  stepSim(a: number, b: number) {
-    if (a === b) return true;
-    const d = b - a;
-    if (d === 1 || d === -1 || d === MW || d === -MW) return canStep(this.m, a, b);
-    const ax = a % MW, bx = b % MW;
-    const ay = (a / MW) | 0, by = (b / MW) | 0;
-    if (Math.abs(ax - bx) > 1 || Math.abs(ay - by) > 1) return false;
-    const c1 = ay * MW + bx;
-    const c2 = by * MW + ax;
-    return (canStep(this.m, a, c1) && canStep(this.m, c1, b)) || (canStep(this.m, a, c2) && canStep(this.m, c2, b));
+  stepSim(a: number, b: number, swim = false) {
+    return stepTiles(this.m, a, b, swim);
+  }
+
+  // Lính được xuống nước sâu: có lệnh bơi, hoặc đang ở dưới nước (luôn bơi vào bờ được).
+  canSwim(i: number) {
+    return this.swim[i] === 1 || this.m.ground[this.tile[i]] === WATER;
   }
 
   tryMove(i: number, vx: number, vy: number): boolean {
     const ox = this.x[i], oy = this.y[i], ot = this.tile[i];
     const nx = Math.min(WORLD_W - 2, Math.max(2, ox + vx));
     const ny = Math.min(WORLD_H - 2, Math.max(2, oy + vy));
+    const sw = this.canSwim(i);
     let nt = this.tileAt(nx, ny);
-    if (this.stepSim(ot, nt)) return this.commit(i, nx, ny, ot, nt);
+    if (this.stepSim(ot, nt, sw)) return this.commit(i, nx, ny, ot, nt);
     nt = this.tileAt(nx, oy);
-    if (Math.abs(vx) > 0.01 && this.stepSim(ot, nt)) return this.commit(i, nx, oy, ot, nt);
+    if (Math.abs(vx) > 0.01 && this.stepSim(ot, nt, sw)) return this.commit(i, nx, oy, ot, nt);
     nt = this.tileAt(ox, ny);
-    if (Math.abs(vy) > 0.01 && this.stepSim(ot, nt)) return this.commit(i, ox, ny, ot, nt);
+    if (Math.abs(vy) > 0.01 && this.stepSim(ot, nt, sw)) return this.commit(i, ox, ny, ot, nt);
     return false;
   }
 
@@ -302,7 +360,8 @@ export class World {
     this.y[i] = ny;
     if (nt !== ot) {
       this.tile[i] = nt;
-      if (this.m.ground[nt] === FORD && this.m.ground[ot] !== FORD && this.rnd() < 0.25) this.addFx(FX_SPLASH, nx, ny, 0);
+      const gn = this.m.ground[nt];
+      if ((gn === FORD || gn === WATER) && this.m.ground[ot] !== gn && this.rnd() < (gn === WATER ? 0.6 : 0.25)) this.addFx(FX_SPLASH, nx, ny, 0);
     }
     return true;
   }
@@ -507,13 +566,27 @@ export class World {
     if (old >= 0 && this.fields[old]) this.fields[old]!.refs--;
     this.field[i] = slot;
     if (slot >= 0) this.fields[slot]!.refs++;
+    this.formNav[i] = -1;
+  }
+
+  private allocNav(nav: LocalNav): number {
+    const k = this.navRing;
+    this.navRing = (k + 1) % MAX_NAVS;
+    this.navs[k] = nav;
+    return k;
   }
 
   // Đưa quân tới một ô. mode = MOVE_ATTACK: đánh mọi địch gặp trên đường;
   // MOVE_MARCH: hành quân bỏ qua địch (dùng để rút lui). Trả về false nếu không tới được.
-  orderMove(units: number[], tx: number, ty: number, mode = MOVE_ATTACK): boolean {
+  // swim = Bơi qua sông: được đi thẳng qua nước sâu (chậm, yếu, không đánh được khi đang bơi).
+  // loose = lệnh Tấn công kiểu AoE: quanh điểm đến là vùng chiến đấu, lính tự chọn chỗ đánh, không dàn trận.
+  orderMove(units: number[], tx: number, ty: number, mode = MOVE_ATTACK, swim = false, loose = false): boolean {
     const list = units.filter((i) => this.alive[i]);
     if (!list.length) return false;
+    if (loose) this.setZone(list, tx * T + 32, ty * T + 32, ZONE_ATTACK_R * T);
+    else this.setZone(list, 0, 0, 0);
+    // có lính đang dưới nước (cầu sập, đang bơi dở) thì cả nhóm đi theo đường bơi để lên bờ được
+    const sw = swim || list.some((i) => this.m.ground[this.tile[i]] === WATER);
     
     const start = nearestPassable(this.m, tx, ty);
     if (start >= 0) {
@@ -521,147 +594,321 @@ export class World {
       ty = (start / MW) | 0;
     }
 
-    // Gom nhóm
+    // Gom nhóm theo đạo quân; lính lẻ (không thuộc đạo quân nào) gom chung một khối
     const groups: Map<number, number[]> = new Map();
-    let unassignedId = -2;
     for (const i of list) {
-      let g = this.armyGroupId[i];
-      if (g === -1) g = unassignedId--; // Các lính không có nhóm coi như các nhóm riêng biệt hoặc gom chung? Cho gom chung thành nhóm -1 đi.
+      const g = this.armyGroupId[i];
       if (!groups.has(g)) groups.set(g, []);
       groups.get(g)!.push(i);
     }
-    
+
     // Hướng tiến quân chung
     const gx = tx * T + 32, gy = ty * T + 32;
     // Tính tâm chung của TẤT CẢ lính để xác định hướng tiến quân
     let allMx = 0, allMy = 0;
     for (const i of list) { allMx += this.x[i]; allMy += this.y[i]; }
     allMx /= list.length; allMy /= list.length;
-    
+
     let ux = gx - allMx, uy = gy - allMy;
     const ul = Math.hypot(ux, uy);
     if (ul < 1) { ux = 1; uy = 0; } else { ux /= ul; uy /= ul; }
     const px = -uy, py = ux;
-    
-    // Bố trí lại tâm các khối (khử đè lên nhau)
-    const blockCenters: { gid: number, units: number[], px: number, py: number, w: number, d: number, dist: number }[] = [];
+
+    // Kích thước mỗi khối theo hình vuông ưu tiên
+    const blockCenters: { gid: number, units: number[], mx: number, my: number, w: number, d: number, dist: number }[] = [];
     for (const [gid, gUnits] of groups.entries()) {
       let gMx = 0, gMy = 0;
       for (const i of gUnits) { gMx += this.x[i]; gMy += this.y[i]; }
       gMx /= gUnits.length; gMy /= gUnits.length;
-      
-      const cols = Math.ceil(Math.sqrt(gUnits.length * 2));
-      const rows = Math.ceil(gUnits.length / cols);
-      const spacing = 40;
 
-      blockCenters.push({ 
-        gid, 
-        units: gUnits, 
-        px: 0, 
-        py: 0, 
-        w: cols * spacing, 
-        d: rows * spacing,
-        dist: Math.hypot(gMx - gx, gMy - gy) 
+      const cols = Math.ceil(Math.sqrt(gUnits.length));
+      const rows = Math.ceil(gUnits.length / cols);
+
+      blockCenters.push({
+        gid,
+        units: gUnits,
+        mx: gMx,
+        my: gMy,
+        w: cols * FORM_SPACING,
+        d: rows * FORM_SPACING,
+        dist: Math.hypot(gMx - gx, gMy - gy)
       });
     }
 
     // Sắp xếp các nhóm theo khoảng cách đến đích: nhóm gần nhất xếp đầu (sẽ đứng trung tâm)
-    blockCenters.sort((a, b) => a.dist - b.dist);
+    blockCenters.sort((a, b) => a.dist - b.dist || a.gid - b.gid);
 
-    if (groups.size > 1) {
-        const rowWidth = Math.min(5, Math.max(3, Math.ceil(Math.sqrt(blockCenters.length)))) | 1;
-        for (let idx = 0; idx < blockCenters.length; idx++) {
-            const b = blockCenters[idx];
-            const row = Math.floor(idx / rowWidth);
-            const pos_in_row = idx % rowWidth;
-            const col = (pos_in_row % 2 === 0) ? (pos_in_row / 2) : -Math.ceil(pos_in_row / 2);
-            // Xếp 2 bên và phía sau
-            b.px = col * 500;
-            b.py = -row * 400; // py âm nghĩa là lùi lại so với hướng tiến quân
-        }
-
-        const GAP = 120; // khoảng nhỏ phân tách đội hình
-        for (let iter = 0; iter < 12; iter++) {
-            let changed = false;
-            for (let i = 0; i < blockCenters.length; i++) {
-                for (let j = i + 1; j < blockCenters.length; j++) {
-                    const a = blockCenters[i], b = blockCenters[j];
-                    const ox = (a.w + b.w) / 2 + GAP - Math.abs(a.px - b.px);
-                    const oy = (a.d + b.d) / 2 + GAP - Math.abs(a.py - b.py);
-                    if (ox > 0 && oy > 0) {
-                        changed = true;
-                        if (ox <= 2 * oy) {
-                            const push = ox / 2;
-                            if (a.px < b.px || (a.px === b.px && a.gid < b.gid)) { a.px -= push; b.px += push; }
-                            else { a.px += push; b.px -= push; }
-                        } else {
-                            const push = oy / 2;
-                            if (a.py < b.py || (a.py === b.py && a.gid < b.gid)) { a.py -= push; b.py += push; }
-                            else { a.py += push; b.py -= push; }
-                        }
-                    }
-                }
-            }
-            if (!changed) break;
-        }
-    }
-
-    // TẠO DUY NHẤT 1 FLOW FIELD CHO TẤT CẢ LÍNH (giải quyết lỗi tràn 40 fields gây đứng yên)
-    const radius = 26;
+    // MỘT flow field chung cho chặng xa (tránh tràn 40 fields); chặng cuối mỗi khối dùng nav cục bộ riêng.
     const allTiles = list.map((i) => this.tile[i]);
-    const f = buildFlowField(this.m, tx, ty, radius, allTiles);
+    const f = buildFlowField(this.m, tx, ty, 4, allTiles, sw);
     if (!f) return false;
     const slot = this.allocField(f);
 
+    // Vùng đi tới được quanh đích: tâm khối rơi vào vách/nước/khu tách biệt thì kéo về ô gần nhất trong vùng.
+    const AREA_R = 48;
+    const area = buildLocalNav(this.m, tx, ty, AREA_R, sw);
+    const claims = new SlotClaims();
+
+    // Bố trí nhiều khối theo lưới trước/sau (gần vuông: 4 nhánh → 2x2, 6 → 3x2...), không dàn hết
+    // thành một hàng ngang. Ô lưới nào bị địa hình chắn thì khối lùi sang ô kế tiếp (ra sau / ra cánh).
+    // Giữa các nhánh chừa khoảng trống rộng để dễ bấm chọn từng nhánh.
+    const BLOCK_GAP = 256; // px (4 ô) giữa hai khối
+    let maxW = 0, maxD = 0;
+    for (const b of blockCenters) { maxW = Math.max(maxW, b.w); maxD = Math.max(maxD, b.d); }
+    const cellW = maxW + BLOCK_GAP, cellD = maxD + BLOCK_GAP;
+    const gridCols = Math.min(5, Math.ceil(Math.sqrt(blockCenters.length)));
+    const cells: [number, number][] = []; // (lệch ngang theo số ô lưới, hàng: 0 = đầu, 1 = sau...)
+    const colsPref: number[] = [];
+    for (let c = 0; c < gridCols; c++) colsPref.push(c - (gridCols - 1) / 2);
+    colsPref.sort((p, q) => Math.abs(p) - Math.abs(q) || p - q); // giữa trước, rồi hai cánh
+    const maxRows = blockCenters.length + 3;
+    for (let r = 0; r < maxRows; r++) for (const c of colsPref) cells.push([c, r]);
+    const edge = (gridCols - 1) / 2;
+    for (let r = 0; r < maxRows; r++) for (let j = 1; j <= 2; j++) { cells.push([edge + j, r]); cells.push([-edge - j, r]); }
+    const usedCell = new Uint8Array(cells.length);
+
     for (const b of blockCenters) {
       const gUnits = b.units;
-      let dstX = gx + px * b.px + ux * b.py;
-      let dstY = gy + py * b.px + uy * b.py;
-      
-      dstX = Math.max(32, Math.min(MW * T - 32, dstX));
-      dstY = Math.max(32, Math.min(MH * T - 32, dstY));
+      const n = gUnits.length;
+      let ctx = tx, cty = ty;
+      if (blockCenters.length > 1) {
+        // ô lưới đầu tiên (theo thứ tự ưu tiên) mà khối vuông đứng vừa ≥ 85%; không có thì lấy ô tốt nhất
+        let bestK = -1, bestFit = -1, bestT: [number, number] = [tx, ty];
+        for (let k = 0; k < cells.length; k++) {
+          if (usedCell[k]) continue;
+          const [c, r] = cells[k];
+          const dx = Math.max(32, Math.min(MW * T - 32, gx + px * c * cellW - ux * r * cellD));
+          const dy = Math.max(32, Math.min(MH * T - 32, gy + py * c * cellW - uy * r * cellD));
+          const dtx = Math.floor(dx / T), dty = Math.floor(dy / T);
+          const st = this.snapToArea(area, dtx, dty, tx, ty);
+          if (Math.hypot(st[0] - dtx, st[1] - dty) > 3) continue; // chỗ này không tới được
+          const fit = squareFit(this.m, area, n, st[0] * T + 32, st[1] * T + 32, ux, uy, claims);
+          if (fit > bestFit) { bestFit = fit; bestK = k; bestT = st; }
+          if (fit >= 0.85) break;
+        }
+        if (bestK >= 0) { usedCell[bestK] = 1; [ctx, cty] = bestT; }
+      }
 
-      const spacing = 40;
-      const cols = Math.ceil(Math.sqrt(gUnits.length * 2));
-      const rows = Math.ceil(gUnits.length / cols);
-      
-      let gMx = 0, gMy = 0;
-      for (const i of gUnits) { gMx += this.x[i]; gMy += this.y[i]; }
-      gMx /= gUnits.length; gMy /= gUnits.length;
+      // Nav cục bộ: phủ cả khối + khoảng dịch tâm + đường tiếp cận
+      const half = Math.ceil(Math.max(b.w, b.d * 2.5) / T / 2);
+      const offT = Math.ceil(Math.hypot(ctx - tx, cty - ty));
+      const R = Math.max(16, Math.min(48, half + 12 + offT));
+      const nav = buildLocalNav(this.m, ctx, cty, R, sw);
+      // nhiều nhánh: khi tự dịch/đổi hình vẫn giữ cách nhánh khác ≥ ~3 ô (chật quá mới cho sát lại)
+      const plan = planFormation(this.m, nav, n, ux, uy, claims, blockCenters.length > 1 ? 192 : 0);
+      for (const sl of plan.slots) claims.add(sl.x, sl.y);
+      const navIdx = this.allocNav(nav);
 
-      const along = (i: number) => (this.x[i] - gMx) * ux + (this.y[i] - gMy) * uy;
-      const across = (i: number) => (this.x[i] - gMx) * px + (this.y[i] - gMy) * py;
-      const sorted = gUnits.slice().sort((a, b) => along(b) - along(a));
-      for (let r = 0; r < rows; r++) {
-        const row = sorted.slice(r * cols, (r + 1) * cols).sort((a, b) => across(a) - across(b));
-        const off = (row.length - 1) / 2;
-        row.forEach((i, c) => {
-          const back = r * spacing - ((rows - 1) * spacing) / 2;
-          const side = (c - off) * spacing;
-          this.formDX[i] = -ux * back + px * side;
-          this.formDY[i] = -uy * back + py * side;
-        });
+      // Ghép lính ↔ ô: hàng đầu nhận lính đang ở phía trước, trong hàng xếp trái → phải
+      const along = (i: number) => (this.x[i] - b.mx) * plan.ux + (this.y[i] - b.my) * plan.uy;
+      const across = (i: number) => (this.x[i] - b.mx) * -plan.uy + (this.y[i] - b.my) * plan.ux;
+      const sortedUnits = gUnits.slice().sort((p, q) => along(q) - along(p) || p - q);
+      const slots = plan.slots.slice().sort((p, q) => p.row - q.row || p.side - q.side);
+      let k = 0;
+      while (k < n) {
+        let e = k;
+        while (e < n && slots[e].row === slots[k].row) e++;
+        const rowUnits = sortedUnits.slice(k, e).sort((p, q) => across(p) - across(q) || p - q);
+        for (let c = 0; c < rowUnits.length; c++) {
+          const i = rowUnits[c];
+          this.formDX[i] = slots[k + c].x - plan.cx;
+          this.formDY[i] = slots[k + c].y - plan.cy;
+        }
+        k = e;
       }
 
       for (const i of gUnits) {
         this.setField(i, slot);
+        this.formNav[i] = navIdx;
+        this.formNavId[i] = nav.id;
         this.hold[i] = 0;
+        this.stuck[i] = 0;
+        this.formBest[i] = Infinity;
+        this.formDirect[i] = 0;
+        this.formWp[i] = -1;
+        this.formNoShort[i] = 0;
+        this.swim[i] = sw ? 1 : 0;
+        this.buildTask[i] = -1;
+        this.stallX[i] = this.x[i];
+        this.stallY[i] = this.y[i];
+        this.stallT[i] = this.time;
         if (mode === MOVE_MARCH) { this.target[i] = -1; this.btarget[i] = -1; }
         this.returning[i] = 0;
         if (mode === MOVE_MARCH && this.moveMode[i] !== MOVE_MARCH) this.retreatT[i] = 0;
         this.moveMode[i] = mode;
-        this.formTargetX[i] = dstX;
-        this.formTargetY[i] = dstY;
+        this.formTargetX[i] = plan.cx;
+        this.formTargetY[i] = plan.cy;
       }
     }
     this.started = true;
     return true;
   }
 
+  // Ô gần (x, y) nhất nằm trong vùng đi tới được `area`; không có thì trả về đích (fx, fy).
+  private snapToArea(area: LocalNav, x: number, y: number, fx: number, fy: number): [number, number] {
+    for (let r = 0; r <= 24; r++) {
+      let best = -1, bd = Infinity;
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= MW || ny >= MH) continue;
+          if (!navReached(area, ny * MW + nx)) continue;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < bd) { bd = d2; best = ny * MW + nx; }
+        }
+      }
+      if (best >= 0) return [best % MW, (best / MW) | 0];
+    }
+    return [fx, fy];
+  }
+
+  // ------------------------------------------------------------ cầu tự xây
+
+  // Kiểm tra chỗ xây cầu quanh ô nước (tx, ty). Cầu nằm ngang sông, rộng BRIDGE_ROWS_BUILT hàng.
+  planBridge(side: number, tx: number, ty: number): { ok: true; y0: number; y1: number; xa: number; xb: number } | { ok: false; reason: string } {
+    const m = this.m;
+    const half = (BRIDGE_ROWS_BUILT - 1) >> 1;
+    const y0 = ty - half, y1 = y0 + BRIDGE_ROWS_BUILT - 1;
+    if (tx < 1 || tx >= MW - 1 || y0 < 1 || y1 >= MH - 1) return { ok: false, reason: "Ngoài bản đồ" };
+    if (m.ground[ty * MW + tx] !== WATER) return { ok: false, reason: "Chọn một điểm trên sông (nước sâu)" };
+    const alive = this.builtBridges.filter((b) => b.alive && b.side === side).length;
+    if (alive >= MAX_BUILT_BRIDGES) return { ok: false, reason: `Mỗi phe chỉ được ${MAX_BUILT_BRIDGES} cầu tự xây (cầu bị phá thì được xây lại)` };
+    let xa = MW, xb = -1;
+    for (let y = y0; y <= y1; y++) {
+      if (m.ground[y * MW + tx] !== WATER) return { ok: false, reason: "Quá sát cầu / bãi cạn có sẵn" };
+      let a = tx, b = tx;
+      while (a - 1 >= 0 && m.ground[y * MW + a - 1] === WATER) a--;
+      while (b + 1 < MW && m.ground[y * MW + b + 1] === WATER) b++;
+      xa = Math.min(xa, a); xb = Math.max(xb, b);
+    }
+    if (xb - xa + 1 > BRIDGE_MAX_LEN) return { ok: false, reason: "Sông quá rộng ở chỗ này" };
+    for (let y = y0 - 1; y <= y1 + 1; y++) for (let x = xa; x <= xb; x++) {
+      const g = m.ground[y * MW + x];
+      if (g === FORD || g === BRIDGE) return { ok: false, reason: "Quá sát cầu / bãi cạn có sẵn" };
+    }
+    // hai đầu cầu phải chạm đất đi được, cùng độ cao mặt nước
+    const lvl = m.level[ty * MW + tx];
+    for (const x of [xa - 1, xb + 1]) {
+      const e = ty * MW + x;
+      if (!passable(m, e) || m.level[e] !== lvl) return { ok: false, reason: "Bờ bên kia là vách/đất cao — không bắc cầu được" };
+    }
+    for (const b of this.builtBridges) {
+      if (!b.alive) continue;
+      if (b.y0 - 2 <= y1 && y0 <= b.y1 + 2 && b.xa <= xb && xa <= b.xb) return { ok: false, reason: "Trùng một cầu tự xây khác" };
+    }
+    return { ok: true, y0, y1, xa, xb };
+  }
+
+  // Giao cho quân đã chọn xây cầu tại ô nước (tx, ty). Quân nào cũng xây được; tối đa BRIDGE_CREW_CAP×1.5
+  // lính gần nhất làm thợ, số còn lại đi theo hộ tống. Trả về null nếu thành công, hoặc lý do không xây được.
+  orderBuildBridge(units: number[], tx: number, ty: number): string | null {
+    const list0 = units.filter((i) => this.alive[i]);
+    if (!list0.length) return "Chưa chọn quân";
+    const side = this.side[list0[0]];
+    const list = list0.filter((i) => this.side[i] === side);
+    const p = this.planBridge(side, tx, ty);
+    if (!p.ok) return p.reason;
+    let mx = 0;
+    for (const i of list) mx += this.x[i];
+    mx /= list.length;
+    const dir: 1 | -1 = mx < ((p.xa + p.xb + 1) / 2) * T ? 1 : -1;
+    const len = p.xb - p.xa + 1;
+    const br: BuiltBridge = {
+      id: this.builtBridges.length, side, y0: p.y0, y1: p.y1, xa: p.xa, xb: p.xb, dir,
+      built: 0, work: 0, hp: BRIDGE_BASE_HP, maxHp: BRIDGE_BASE_HP + BRIDGE_HP_PER_COL * len, alive: true, done: false,
+    };
+    this.builtBridges.push(br);
+    this.bridgeCrew.push(0);
+    const bankX = dir > 0 ? p.xa - 1 : p.xb + 1, midY = (p.y0 + p.y1) >> 1;
+    // tới bờ bằng đường thường (không bơi)
+    this.orderMove(list, bankX, midY, MOVE_ATTACK, false);
+    const bx = (bankX + 0.5) * T, by = (midY + 0.5) * T;
+    const crew = list.slice().sort((a, b) => Math.hypot(this.x[a] - bx, this.y[a] - by) - Math.hypot(this.x[b] - bx, this.y[b] - by) || a - b)
+      .slice(0, Math.ceil(BRIDGE_CREW_CAP * 1.5));
+    for (const i of crew) this.buildTask[i] = br.id;
+    this.pushEvent(side, `Quân ${side === 0 ? "Tây" : "Đông"} bắt đầu bắc cầu (${len} ô)`);
+    return null;
+  }
+
+  // Cột nước thứ k (0 = sát bờ khởi công) của cầu.
+  bridgeCol(br: BuiltBridge, k: number) {
+    return br.dir > 0 ? br.xa + k : br.xb - k;
+  }
+
+  // Điểm gần (x, y) nhất trên cầu (phần đã lát + giàn giáo ở mũi cầu).
+  private bridgeNearest(br: BuiltBridge, x: number, y: number): [number, number] {
+    const k = Math.max(0, br.built);
+    const c0 = this.bridgeCol(br, 0), c1 = this.bridgeCol(br, Math.min(k, br.xb - br.xa));
+    const lx = Math.min(c0, c1) * T, rx = (Math.max(c0, c1) + 1) * T;
+    return [Math.max(lx, Math.min(rx, x)), Math.max(br.y0 * T, Math.min((br.y1 + 1) * T, y))];
+  }
+
+  // Chỗ thợ đứng: cột vừa lát xong (hoặc bờ khi chưa lát), rải theo các hàng của cầu.
+  private bridgeStand(br: BuiltBridge, i: number): [number, number] {
+    const x = br.built > 0 ? this.bridgeCol(br, br.built - 1) : br.dir > 0 ? br.xa - 1 : br.xb + 1;
+    const rows = br.y1 - br.y0 + 1;
+    const r = i % rows, back = ((i / rows) | 0) % 3;
+    return [(x + 0.5) * T - br.dir * back * 20, (br.y0 + r + 0.5) * T];
+  }
+
+  // Bỏ dở cầu đang xây (tháo giàn giáo, trả lại lượt xây). Cầu đã xong thì giữ nguyên.
+  abandonBridge(id: number) {
+    const br = this.builtBridges[id];
+    if (!br || !br.alive || br.done) return;
+    this.damageBridge(id, Infinity, true);
+  }
+
+  private damageBridge(id: number, amount: number, quiet = false) {
+    const br = this.builtBridges[id];
+    if (!br || !br.alive) return;
+    br.hp -= amount;
+    if (br.hp > 0) return;
+    br.hp = 0;
+    br.alive = false;
+    const m = this.m;
+    for (let k = 0; k < br.built; k++) {
+      const x = this.bridgeCol(br, k);
+      for (let y = br.y0; y <= br.y1; y++) if (m.ground[y * MW + x] === BRIDGE) m.ground[y * MW + x] = WATER;
+      if (k % 3 === 0) this.addFx(FX_SPLASH, (x + 0.5) * T, ((br.y0 + br.y1 + 1) / 2) * T, 0);
+    }
+    invalidateNav(m, br.xa, br.y0, br.xb, br.y1);
+    for (let i = 0; i < this.n; i++) if (this.buildTask[i] === id) this.buildTask[i] = -1;
+    if (!quiet) this.pushEvent(1 - br.side, `Cầu tự xây của quân ${br.side === 0 ? "Tây" : "Đông"} bị phá sập!`);
+  }
+
+  // Lát cầu theo số thợ đang đứng ở mũi cầu (đếm trong updateUnit).
+  private updateBridges(dt: number) {
+    const m = this.m;
+    for (const br of this.builtBridges) {
+      const crew = Math.min(BRIDGE_CREW_CAP, this.bridgeCrew[br.id]);
+      this.bridgeCrew[br.id] = 0;
+      if (!br.alive || br.done || crew === 0) continue;
+      br.work += crew * dt;
+      const len = br.xb - br.xa + 1;
+      while (br.work >= BRIDGE_COL_WORK && br.built < len) {
+        br.work -= BRIDGE_COL_WORK;
+        const x = this.bridgeCol(br, br.built);
+        for (let y = br.y0; y <= br.y1; y++) if (m.ground[y * MW + x] === WATER) m.ground[y * MW + x] = BRIDGE;
+        invalidateNav(m, x, br.y0, x, br.y1);
+        br.built++;
+        br.hp += BRIDGE_HP_PER_COL;
+      }
+      if (br.built >= len) {
+        br.done = true;
+        br.work = 0;
+        for (let i = 0; i < this.n; i++) if (this.buildTask[i] === br.id) this.buildTask[i] = -1;
+        this.pushEvent(br.side, `Quân ${br.side === 0 ? "Tây" : "Đông"} bắc xong cầu mới!`);
+      }
+    }
+  }
+
   orderHold(units: number[]) {
     for (const i of units) {
       if (!this.alive[i] || this.type[i] === PAWN) continue;
       this.setField(i, -1);
+      this.buildTask[i] = -1;
+      this.zoneR[i] = 0;
       this.hold[i] = 1;
       this.target[i] = -1;
       this.moveMode[i] = MOVE_ATTACK;
@@ -690,6 +937,8 @@ export class World {
       const marching = this.moveMode[i] === MOVE_MARCH && this.field[i] >= 0;
       if (marching && this.retreatT[i] >= RALLY_MIN_RETREAT) { this.rallyUntil[i] = this.time + RALLY_DUR; bonus++; }
       this.setField(i, -1);
+      this.buildTask[i] = -1;
+      this.zoneR[i] = 0;
       this.moveMode[i] = MOVE_ATTACK;
       this.hold[i] = 0;
       this.returning[i] = 0;
@@ -717,6 +966,9 @@ export class World {
       const slot = this.allocField(f);
       for (const i of units) {
         this.setField(i, slot);
+        this.buildTask[i] = -1;
+        this.zoneR[i] = 0;
+        this.swim[i] = 0;
         this.hold[i] = 0;
         this.moveMode[i] = MOVE_ATTACK;
         this.returning[i] = 0;
@@ -790,9 +1042,14 @@ export class World {
     this.tick++;
     this.rebuildGrid();
     this.engaged.fill(0);
+    // Giới hạn vây đánh: chỉ đếm lính cận chiến đang ở SÁT mục tiêu (≤ ENGAGE_R). Đếm cả lính đứng xa
+    // (cả nhánh cùng nhận một mục tiêu chung) làm mục tiêu "đầy" giả → cả nhánh đứng chờ, không đánh.
+    const ER2 = ENGAGE_R * ENGAGE_R;
     for (let i = 0; i < this.n; i++) {
       const tg = this.target[i];
-      if (tg >= 0 && this.alive[i] && this.type[i] !== ARCHER && this.type[i] !== MONK && this.engaged[tg] < 255) this.engaged[tg]++;
+      if (tg < 0 || !this.alive[i] || this.type[i] === ARCHER || this.type[i] === MONK || this.engaged[tg] >= 255) continue;
+      const dx = this.x[tg] - this.x[i], dy = this.y[tg] - this.y[i];
+      if (dx * dx + dy * dy <= ER2) this.engaged[tg]++;
     }
     // Đảo chiều duyệt mỗi tick để di chuyển / chọn mục tiêu không ưu tiên phe có chỉ số nhỏ (phe Tây)
     const fwd = (this.tick & 1) === 0;
@@ -804,6 +1061,7 @@ export class World {
     }
     this.updateArrows(dt);
     this.applyDamage();
+    if (this.builtBridges.length) this.updateBridges(dt);
     this.updateSheep(dt);
     // Cập nhật sương mù và bao vây 3 lần/giây (mỗi ~333ms game)
     if (this.time - this._visLastT >= 0.33) {
@@ -816,6 +1074,7 @@ export class World {
       this.updateVision();
       this.updateEncirclement();
       this.updateUnitStatus(dtv);
+      this.updateCallToArms();
       this.updateCrowding();
       this.updateTowers(dtv);
       if (this.winner < 0) this.checkVictory();
@@ -1071,6 +1330,51 @@ export class World {
     return this.crowded[i] ? CROWD_SPEED : 1;
   }
 
+  // ---- Tiếp viện (3Hz): quân ta bị đánh ở đâu thì lính đang rảnh quanh đó (≤ ~1–2 ô lưới 8 ô) nhận
+  // vùng chiến đấu tạm tại chỗ đó và lao vào đánh. Vùng tự tắt sau ZONE_CALL_T giây không còn bị đánh;
+  // khi tắt, lính neo lại tại chỗ đang đứng (không kéo cả đám về chỗ cũ).
+  private updateCallToArms() {
+    const G = MW / CALL_CELL;
+    for (let s = 0; s < 2; s++) this._hitCells[s].fill(0);
+    for (let i = 0; i < this.n; i++) {
+      if (!this.alive[i] || this.time - this.lastHitT[i] > 0.5) continue;
+      const c = Math.floor(this.y[i] / T / CALL_CELL) * G + Math.floor(this.x[i] / T / CALL_CELL);
+      if (this._hitCells[this.side[i]][c] < 255) this._hitCells[this.side[i]][c]++;
+    }
+    for (let i = 0; i < this.n; i++) {
+      if (!this.alive[i]) continue;
+      // hết hạn vùng tiếp viện
+      if (this.zoneR[i] > 0 && this.zoneUntil[i] !== Infinity && this.time > this.zoneUntil[i]) {
+        this.zoneR[i] = 0;
+        if (this.field[i] < 0) { this.anchorX[i] = this.x[i]; this.anchorY[i] = this.y[i]; }
+      }
+      // chỉ lính đang rảnh: không có lệnh di chuyển, không Giữ vị trí, không đang làm thợ, không phải trinh sát/tu sĩ
+      const t = this.type[i];
+      if (this.field[i] >= 0 || this.hold[i] || this.buildTask[i] >= 0 || t === PAWN || t === MONK) continue;
+      if (this.zoneR[i] > 0 && this.zoneUntil[i] === Infinity) continue; // đang theo lệnh Tấn công
+      const hc = this._hitCells[this.side[i]];
+      const cx = Math.floor(this.x[i] / T / CALL_CELL), cy = Math.floor(this.y[i] / T / CALL_CELL);
+      let best = -1, bn = 0, bd = Infinity;
+      const maxD2 = ((ZONE_CALL_R + 4) * T) ** 2;
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const x = cx + dx, y = cy + dy;
+        if (x < 0 || y < 0 || x >= G || y >= G) continue;
+        const n = hc[y * G + x];
+        if (n < 2) continue;
+        const d2 = ((x + 0.5) * CALL_CELL * T - this.x[i]) ** 2 + ((y + 0.5) * CALL_CELL * T - this.y[i]) ** 2;
+        if (d2 > maxD2) continue;
+        // gần hơn thì ưu tiên; cùng mức gần thì chỗ bị đánh đông hơn
+        const sc = d2 - n * 4 * T * T;
+        if (sc < bd) { bd = sc; bn = n; best = y * G + x; }
+      }
+      if (best < 0 || bn < 2) continue; // lẻ tẻ 1 lính trúng tên thì chưa kéo cả khu
+      this.zoneX[i] = ((best % G) + 0.5) * CALL_CELL * T;
+      this.zoneY[i] = (((best / G) | 0) + 0.5) * CALL_CELL * T;
+      this.zoneR[i] = ZONE_CALL_R * T;
+      this.zoneUntil[i] = this.time + ZONE_CALL_T;
+    }
+  }
+
   // ---- Rối loạn, hồi máu trong rừng (3Hz)
   private updateUnitStatus(dtv: number) {
     const forest = this.m.forest;
@@ -1280,12 +1584,38 @@ export class World {
   }
 
   // cap: bỏ qua địch đã có đủ `cap` lính cận chiến vây đánh (giới hạn mặt trận)
-  private findEnemy(i: number, radius: number, cap = 255): number {
+  // Lính đang bị dây xích Phòng thủ: không có lệnh di chuyển, không Giữ vị trí, tư thế Phòng thủ.
+  private leashed(i: number) {
+    return this.stance[i] === STANCE_DEFEND && this.field[i] < 0 && !this.hold[i];
+  }
+
+  // Vùng giới hạn chọn mục tiêu của lính: vùng chiến đấu nếu đang có, không thì dây xích quanh điểm neo.
+  private leashArea(i: number): [number, number, number] {
+    if (this.zoneR[i] > 0) return [this.zoneX[i], this.zoneY[i], this.zoneR[i]];
+    return [this.anchorX[i], this.anchorY[i], LEASH_R * T];
+  }
+
+  // Giao vùng chiến đấu cho quân (lệnh Tấn công). r = 0 → xoá vùng.
+  setZone(units: number[], x: number, y: number, r: number, until = Infinity) {
+    for (const i of units) { this.zoneX[i] = x; this.zoneY[i] = y; this.zoneR[i] = r; this.zoneUntil[i] = until; }
+  }
+
+  // Tìm mục tiêu tốt nhất trong `radius` ô (kiểu AoE: không chỉ "gần nhất").
+  // Điểm = khoảng cách (px) − thưởng; điểm thấp nhất được chọn:
+  //   −PRI_ATTACKER  địch đang đánh chính mình (phản công trước)
+  //   −PRI_ARCHER    cung thủ (mối đe doạ tầm xa) — chỉ với lính cận chiến
+  //   −PRI_LOWHP×(1−hp%) địch sắp chết (kết liễu nhanh)
+  // leash: bỏ địch nằm ngoài vùng dây xích (LEASH_R ô quanh điểm neo) — đã không đuổi tới được thì đừng
+  // nhận, nếu không lính sẽ lặp "lao lên → bị kéo về" mãi. Riêng kẻ đang đánh mình thì luôn được nhận.
+  private findEnemy(i: number, radius: number, cap = 255, leash = false): number {
     const s = this.side[i];
     const t0 = this.tile[i];
     const tx = t0 % MW, ty = (t0 / MW) | 0;
     const px = this.x[i], py = this.y[i];
-    let best = -1, bd = Infinity;
+    const melee = this.type[i] !== ARCHER && this.type[i] !== MONK;
+    const [ax, ay, lr] = this.leashArea(i);
+    const lr2 = lr * lr;
+    let best = -1, bs = Infinity;
     for (let r = 0; r <= radius; r++) {
       for (let dy = -r; dy <= r; dy++) {
         const yy = ty + dy;
@@ -1296,12 +1626,18 @@ export class World {
           if (xx < 0 || xx >= MW) continue;
           for (let j = this.head[yy * MW + xx]; j >= 0; j = this.next[j]) {
             if (this.side[j] === s || !this.alive[j] || this.engaged[j] >= cap) continue;
-            const d = (this.x[j] - px) ** 2 + (this.y[j] - py) ** 2;
-            if (d < bd && this.targetable(s, j)) { bd = d; best = j; }
+            const hitsMe = this.target[j] === i;
+            if (leash && !hitsMe && (this.x[j] - ax) ** 2 + (this.y[j] - ay) ** 2 > lr2) continue;
+            const d = Math.sqrt((this.x[j] - px) ** 2 + (this.y[j] - py) ** 2);
+            let sc = d - PRI_LOWHP * (1 - this.hp[j] / STATS[this.type[j]].hp);
+            if (hitsMe) sc -= PRI_ATTACKER;
+            if (melee && this.type[j] === ARCHER) sc -= PRI_ARCHER;
+            if (sc < bs && this.targetable(s, j)) { bs = sc; best = j; }
           }
         }
       }
-      if (best >= 0 && bd <= (r * T) ** 2) break;
+      // mọi địch ở vòng r+1 cách ít nhất r·T, điểm ít nhất r·T − PRI_MAX → không thể tốt hơn thì dừng
+      if (best >= 0 && r * T - PRI_MAX > bs) break;
     }
     return best;
   }
@@ -1322,6 +1658,52 @@ export class World {
       }
     }
     return best;
+  }
+
+  // Đường ngắn nhất tâm khối → ô đội hình (lần ngược nav từ ô về tâm). Trả về ô trên đường đó
+  // gần ô đội hình nhất mà lính nhìn thẳng thấy được; -1 nếu không có.
+  private slotWaypoint(i: number, nav: LocalNav, sx: number, sy: number): number {
+    let t = this.tileAt(sx, sy);
+    const chain: number[] = [];
+    for (let k = 0; k < 256; k++) {
+      const c = navCell(nav, t);
+      if (c < 0) break;
+      const dd = nav.dir[c];
+      if (dd === 255) break;
+      chain.push(t);
+      if (dd === 8) break;
+      t += DY[dd] * MW + DX[dd];
+    }
+    // chain[0] là ô chứa ô đội hình (đã biết không thấy thẳng) → xét từ chain[1]
+    for (let k = 1; k < chain.length; k++) {
+      const c = chain[k];
+      const x = (c % MW) * T + 32, y = ((c / MW) | 0) * T + 32;
+      if (Math.abs(x - this.x[i]) > 900 || Math.abs(y - this.y[i]) > 900) continue;
+      if (c === this.tile[i] || this.clearLine(i, x, y)) return c;
+    }
+    return -1;
+  }
+
+  // Đi thẳng tới (x, y); vướng địa hình thì thử các hướng khác.
+  private steerTo(i: number, x: number, y: number, sp: number, d: number): boolean {
+    const l = Math.hypot(x - this.x[i], y - this.y[i]) || 1;
+    const vx = (x - this.x[i]) / l, vy = (y - this.y[i]) / l;
+    const s = Math.min(sp, l);
+    if (Math.abs(vx) > 0.1) this.face[i] = vx > 0 ? 1 : -1;
+    return this.tryMove(i, vx * s, vy * s) || this.tryMoveFlowFallback(i, d, s);
+  }
+
+  // Bước theo hướng d (0..7) từ ô cur: nhắm tâm ô kế tiếp, pha thêm hướng gốc cho mượt.
+  private stepDir(i: number, cur: number, d: number, sp: number): boolean {
+    const tx = (cur % MW) + DX[d], ty = ((cur / MW) | 0) + DY[d];
+    let vx = tx * T + 32 - this.x[i];
+    let vy = ty * T + 32 - this.y[i];
+    const l = Math.hypot(vx, vy) || 1;
+    const dl = Math.hypot(DX[d], DY[d]);
+    vx = vx / l * 0.6 + (DX[d] / dl) * 0.4;
+    vy = vy / l * 0.6 + (DY[d] / dl) * 0.4;
+    if (Math.abs(vx) > 0.1) this.face[i] = vx > 0 ? 1 : -1;
+    return this.tryMove(i, vx * sp, vy * sp) || this.tryMoveFlowFallback(i, d, sp);
   }
 
   // Straight-line walkability (so melee units don't chase across rivers/cliffs).
@@ -1348,16 +1730,7 @@ export class World {
 
   // Straight-line walkability (so melee units don't chase across rivers/cliffs).
   private clearLine(i: number, x1: number, y1: number): boolean {
-    const x0 = this.x[i], y0 = this.y[i];
-    const d = Math.hypot(x1 - x0, y1 - y0);
-    const n = Math.ceil(d / 24);
-    let prev = this.tile[i];
-    for (let k = 1; k <= n; k++) {
-      const t = this.tileAt(x0 + ((x1 - x0) * k) / n, y0 + ((y1 - y0) * k) / n);
-      if (t !== prev && !this.stepSim(prev, t)) return false;
-      prev = t;
-    }
-    return true;
+    return lineWalkable(this.m, this.x[i], this.y[i], x1, y1, this.canSwim(i));
   }
 
   private findBuilding(i: number): number {
@@ -1369,7 +1742,18 @@ export class World {
       if (b.side === s || b.hp <= 0) continue;
       if (this.distToBuilding(i, b) < r) return k;
     }
+    // cầu tự xây của địch trong tầm → phá
+    for (const br of this.builtBridges) {
+      if (!br.alive || br.side === s) continue;
+      const [bx, by] = this.bridgeNearest(br, this.x[i], this.y[i]);
+      if (Math.hypot(bx - this.x[i], by - this.y[i]) < r) return BRIDGE_TARGET + br.id;
+    }
     return -1;
+  }
+
+  private bTargetAlive(bt: number) {
+    if (bt >= BRIDGE_TARGET) { const br = this.builtBridges[bt - BRIDGE_TARGET]; return !!br && br.alive; }
+    return this.m.buildings[bt].hp > 0;
   }
 
   distToBuilding(i: number, b: Building) {
@@ -1382,8 +1766,12 @@ export class World {
     const t = this.tile[i];
     let pushX = 0, pushY = 0, c = 0;
     const px = this.x[i], py = this.y[i];
+    // Lính đang hành quân không bị lính đứng yên đẩy lùi (lính đứng yên tự dạt ra rồi về chỗ),
+    // nếu không sẽ giằng co mãi khi phải đi xuyên qua một khối quân đang đứng.
+    const mover = this.field[i] >= 0;
     for (let j = this.head[t]; j >= 0 && c < 8; j = this.next[j], c++) {
       if (j === i) continue;
+      if (mover && this.field[j] < 0 && this.side[j] === this.side[i]) continue;
       let dx = px - this.x[j];
       let dy = py - this.y[j];
       const d2 = dx * dx + dy * dy;
@@ -1411,12 +1799,15 @@ export class World {
     // Chen chúc: dễ trúng tên · Đang lội bãi cạn: nhận thêm sát thương
     if (attackerType === ARCHER && this.crowded[j]) amount *= CROWD_ARROW_TAKEN;
     if (this.m.ground[this.tile[j]] === FORD) amount *= FORD_TAKEN;
+    else if (this.m.ground[this.tile[j]] === WATER) amount *= SWIM_TAKEN; // đang bơi: dễ bị hạ
     // Trại lính còn đứng: Kiếm sĩ & Thương kỵ bền hơn 10% (tương đương +10% HP tối đa)
     if ((this.type[j] === WARRIOR || this.type[j] === LANCER) && this.bAlive[this.side[j]].Barracks) amount /= 1.1;
     this.lastCombat[j] = this.time;
     this.pendDmg[j] += amount;
     if (routed) this.pendRouted[j] = 1;
     // Ghi nhận mục tiêu và báo động cho cả phe (để cung thủ ở block khác cũng thấy)
+    if (attackerId >= 0) this.lastHitBy[j] = attackerId;
+    this.lastHitT[j] = this.time;
     if (attackerId >= 0 && this.armyGroupId[j] !== -1) {
       this.groupTarget[this.armyGroupId[j]] = attackerId;
     }
@@ -1447,6 +1838,7 @@ export class World {
   }
 
   private damageBuilding(k: number, amount: number, attackerSide?: number) {
+    if (k >= BRIDGE_TARGET) return this.damageBridge(k - BRIDGE_TARGET, amount);
     const b = this.m.buildings[k];
     if (b.hp <= 0) return;
     // V2: Không giữ Cầu giữa → công trình và Thành địch chỉ nhận 25% sát thương
@@ -1471,6 +1863,7 @@ export class World {
 
   private arrive(i: number) {
     this.setField(i, -1);
+    if (this.m.ground[this.tile[i]] !== WATER) this.swim[i] = 0; // lên bờ rồi: đứng yên không trôi xuống nước
     this.moveMode[i] = MOVE_ATTACK;
     this.anchorX[i] = this.x[i];
     this.anchorY[i] = this.y[i];
@@ -1485,6 +1878,8 @@ export class World {
     if (this.state[i] === S_MOVE) this.stillT[i] = 0; else this.stillT[i] += dt;
     const prevChase = this.chaseT[i];
     this.chaseT[i] = 0;
+    // --- đòn cận chiến đang vung: tới khoảnh khắc trúng mới trừ máu (mục tiêu đã chạy khỏi tầm thì trượt)
+    if (this.hitTg[i] !== -1 && this.time >= this.hitAt[i]) this.resolveHit(i);
 
     // --- hành quân (rút lui): bỏ qua địch, chỉ đi theo trường lực
     if (this.moveMode[i] === MOVE_MARCH && this.field[i] < 0) this.moveMode[i] = MOVE_ATTACK;
@@ -1524,19 +1919,25 @@ export class World {
 
     // --- validate / acquire target
     let tg = this.target[i];
+    let lostNow = false;
     if (tg >= 0) {
       const lost = !this.alive[tg] || (t === MONK ? this.hp[tg] >= STATS[this.type[tg]].hp : !this.targetable(s, tg));
-      if (lost) tg = -1;
+      if (lost) { tg = -1; lostNow = true; }
     }
-    if (!marching && retarget && (tg < 0 || t === ARCHER)) {
+    // Searching (AoE): vừa mất mục tiêu thì dò lại NGAY, không đợi tới lượt 8 tick
+    const scan = retarget || lostNow;
+    const leash = this.leashed(i);
+    if (!marching && scan && (tg < 0 || t === ARCHER)) {
       if (t === MONK) tg = this.findWounded(i, 4);
       else {
         let range = st.aggro;
-        if (this.time < this.alertUntil[s]) {
-          range += 8; // Tăng aggro khi phe đang có báo động (combat gần đó)
+        if (this.time < this.alertUntil[s] || this.zoneR[i] > 0) {
+          range += 8; // Tăng aggro khi phe đang có báo động (combat gần đó) hoặc đang trong vùng chiến đấu
         }
         if (t === ARCHER && this.m.level[this.tile[i]] > 0) range += 2;
-        const e = this.findEnemy(i, this.hold[i] && t !== ARCHER ? 2 : range, t === ARCHER ? 255 : MELEE_CAP);
+        // Giữ vị trí, hoặc đang làm thợ bắc cầu: chỉ đánh địch áp sát (≤ 2 ô), không bỏ việc đi đuổi
+        const close = (this.hold[i] && t !== ARCHER) || this.buildTask[i] >= 0;
+        const e = this.findEnemy(i, close ? 2 : range, t === ARCHER ? 255 : MELEE_CAP, leash);
         if (e >= 0 && (t === ARCHER || this.clearLine(i, this.x[e], this.y[e]))) {
           tg = e;
           if (t !== ARCHER && this.engaged[e] < 255) this.engaged[e]++;
@@ -1549,16 +1950,28 @@ export class World {
       }
     }
     // Kế thừa mục tiêu từ đoàn quân nếu đang rảnh và không rút lui
-    if (!marching && tg < 0 && this.armyGroupId[i] !== -1 && t !== MONK && retarget) {
+    if (!marching && tg < 0 && this.armyGroupId[i] !== -1 && t !== MONK && scan && this.buildTask[i] < 0) {
       const gt = this.groupTarget[this.armyGroupId[i]];
-      if (gt >= 0 && this.alive[gt] && this.targetable(s, gt)) {
+      const melee = t !== ARCHER;
+      const [lax, lay, lr] = this.leashArea(i);
+      const inLeash = gt >= 0 && (!leash || (this.x[gt] - lax) ** 2 + (this.y[gt] - lay) ** 2 <= lr * lr);
+      if (gt >= 0 && inLeash && this.alive[gt] && this.targetable(s, gt) && (!melee || this.engaged[gt] < MELEE_CAP)) {
         tg = gt;
+      } else if (gt >= 0 && melee) {
+        // mục tiêu chung đã đủ người vây / ngoài dây xích: tìm địch khác còn chỗ quanh mình
+        const e = this.findEnemy(i, st.aggro + 6, MELEE_CAP, leash);
+        if (e >= 0 && this.clearLine(i, this.x[e], this.y[e])) tg = e;
       }
     }
+    if (tg >= 0) this.lastTargetT[i] = this.time;
+    // Đang bơi: không đánh được (chỉ bơi tiếp / vào bờ)
+    const swimming = this.m.ground[this.tile[i]] === WATER;
+    if (swimming) tg = -1;
     this.target[i] = tg;
     let bt = this.btarget[i];
-    if (bt >= 0 && this.m.buildings[bt].hp <= 0) bt = -1;
-    if (!marching && tg < 0 && bt < 0 && t !== MONK && (i + this.tick) % 16 === 0) bt = this.findBuilding(i);
+    if (bt >= 0 && !this.bTargetAlive(bt)) bt = -1;
+    if (swimming) bt = -1;
+    else if (!marching && tg < 0 && bt < 0 && t !== MONK && (i + this.tick) % 16 === 0) bt = this.findBuilding(i);
     this.btarget[i] = bt;
 
     // --- engage
@@ -1567,6 +1980,12 @@ export class World {
       if (tg >= 0) {
         dx = this.x[tg] - this.x[i];
         dy = this.y[tg] - this.y[i];
+        dist = Math.hypot(dx, dy);
+      } else if (bt >= BRIDGE_TARGET) {
+        // cầu tự xây: đánh vào điểm gần nhất của phần cầu đã lát / giàn giáo
+        const [bx, by] = this.bridgeNearest(this.builtBridges[bt - BRIDGE_TARGET], this.x[i], this.y[i]);
+        dx = bx - this.x[i];
+        dy = by - this.y[i];
         dist = Math.hypot(dx, dy);
       } else {
         const b = this.m.buildings[bt];
@@ -1577,7 +1996,8 @@ export class World {
       let range = st.range;
       const high = tg >= 0 && this.m.level[this.tile[i]] > this.m.level[this.tile[tg]];
       if (t === ARCHER && high) range += 2 * T;
-      if (dist <= range + (t === ARCHER || t === MONK ? 0 : 14)) {
+      const hyst = this.state[i] === S_ATTACK ? RANGE_HYST : 0;
+      if (dist <= range + (t === ARCHER || t === MONK ? 0 : 14) + hyst) {
         this.state[i] = S_ATTACK;
         if (Math.abs(dx) > 4) this.face[i] = dx > 0 ? 1 : -1;
         if (this.cd[i] <= 0) {
@@ -1590,12 +2010,16 @@ export class World {
         return;
       }
       // Tư thế Phòng thủ: không đuổi quá LEASH_R ô quanh điểm neo
-      if (!this.hold[i] && this.field[i] < 0 && this.stance[i] === STANCE_DEFEND &&
-          Math.hypot(this.x[i] - this.anchorX[i], this.y[i] - this.anchorY[i]) > LEASH_R * T) {
-        this.target[i] = -1;
-        this.btarget[i] = -1;
-        this.returning[i] = 1;
-        return;
+      // (đang có vùng chiến đấu thì xích theo vùng, rộng hơn 4 ô; quay về tâm vùng)
+      if (!this.hold[i] && this.field[i] < 0 && this.stance[i] === STANCE_DEFEND) {
+        const [lax, lay, lr] = this.leashArea(i);
+        if (Math.hypot(this.x[i] - lax, this.y[i] - lay) > lr + (this.zoneR[i] > 0 ? 4 * T : 0)) {
+          this.target[i] = -1;
+          this.btarget[i] = -1;
+          if (this.zoneR[i] > 0) { this.anchorX[i] = lax; this.anchorY[i] = lay; }
+          this.returning[i] = 1;
+          return;
+        }
       }
       if (!this.hold[i]) {
         this.chaseT[i] = prevChase + dt;
@@ -1604,12 +2028,20 @@ export class World {
         
         // Combat spacing: lính đánh gần không chen lên nếu mục tiêu đã quá đông
         const isMelee = t === WARRIOR || t === LANCER || t === PAWN;
-        if (isMelee && dist > range + 14 && tg >= 0 && this.engaged[tg] >= MELEE_CAP) {
-           // Chờ phía sau (đứng yên nhưng hướng mặt về mục tiêu)
-           this.state[i] = S_IDLE;
-           this.setAnim(i, this.idleAnim(i));
-           this.separate(i);
-           return;
+        // (lính đã ở sát mục tiêu thì chính nó cũng nằm trong số đếm — không tự chặn mình)
+        const others = this.engaged[tg] - (dist <= ENGAGE_R ? 1 : 0);
+        if (isMelee && dist > range + 14 && tg >= 0 && others >= MELEE_CAP) {
+           // Mục tiêu đã đủ người vây: đổi sang địch khác còn chỗ; không có thì mới đứng chờ phía sau
+           const alt = retarget ? this.findEnemy(i, st.aggro + 4, MELEE_CAP, leash) : -1;
+           if (alt >= 0 && alt !== tg && this.clearLine(i, this.x[alt], this.y[alt])) {
+             this.target[i] = alt;
+             this.engaged[alt]++;
+           } else {
+             this.state[i] = S_IDLE;
+             this.setAnim(i, this.idleAnim(i));
+             this.separate(i);
+             return;
+           }
         }
 
         if (this.tryMove(i, dx * sp, dy * sp)) {
@@ -1629,56 +2061,132 @@ export class World {
     if (fi >= 0 && this.fields[fi]) {
       const f = this.fields[fi]!;
       const cur = this.tile[i];
-      const d = f.dir[cur];
-      
       const gx = this.formTargetX[i] + this.formDX[i];
       const gy = this.formTargetY[i] + this.formDY[i];
       const distToSlot = Math.hypot(gx - this.x[i], gy - this.y[i]);
 
-      if (distToSlot < 10 || d === DIR_NONE) {
-        this.arrive(i); // tới ô đội hình (hoặc ra ngoài trường lực)
-      } else if ((d === DIR_GOAL || distToSlot < 150) && this.clearLine(i, gx, gy)) {
-        // steer directly to slot
-        const sp = st.speed * this.moveMul(i) * tileSpeed(this.m, cur) * dt;
-        let vx = (gx - this.x[i]) / distToSlot;
-        let vy = (gy - this.y[i]) / distToSlot;
-        if (Math.abs(vx) > 0.1) this.face[i] = vx > 0 ? 1 : -1;
-        if (!this.tryMove(i, vx * sp, vy * sp)) this.tryMoveFlowFallback(i, d, sp);
-        this.state[i] = S_MOVE;
-        this.setAnim(i, this.runAnim(i));
-        this.separate(i);
-        this.stuck[i] = 0;
-        return;
+      // Lệnh Tấn công: đã vào vùng chiến đấu mà vừa đánh nhau → dừng tại chỗ, không quay về xếp hàng.
+      // Chưa gặp địch thì chỉ cần tới gần ô (≤ 2 ô) là dừng — không dàn trận chỉnh tề.
+      const inZone = this.zoneR[i] > 0 && Math.hypot(this.x[i] - this.zoneX[i], this.y[i] - this.zoneY[i]) < this.zoneR[i];
+      if (inZone && (this.time - this.lastCombat[i] < 4 || distToSlot < 2 * T)) {
+        this.arrive(i);
+      } else if (distToSlot < 10) {
+        this.arrive(i); // tới ô đội hình: neo đúng vào ô
+        this.anchorX[i] = gx;
+        this.anchorY[i] = gy;
       } else {
-        if (d === DIR_GOAL) {
-          this.arrive(i);
-          return;
-        }
-        const tx = (cur % MW) + DX[d], ty = ((cur / MW) | 0) + DY[d];
-        let vx = tx * T + 32 - this.x[i];
-        let vy = ty * T + 32 - this.y[i];
-        const l = Math.hypot(vx, vy) || 1;
-        const dl = Math.hypot(DX[d], DY[d]);
-        vx = vx / l * 0.6 + (DX[d] / dl) * 0.4;
-        vy = vy / l * 0.6 + (DY[d] / dl) * 0.4;
         const sp = st.speed * this.moveMul(i) * tileSpeed(this.m, cur) * dt;
-        if (Math.abs(vx) > 0.1) this.face[i] = vx > 0 ? 1 : -1;
-        
-        let moved = this.tryMove(i, vx * sp, vy * sp);
-        if (!moved) moved = this.tryMoveFlowFallback(i, d, sp);
-        
-        if (!moved) this.stuck[i] += dt;
-        else this.stuck[i] = 0;
+        const ni = this.formNav[i];
+        const nav = ni >= 0 && this.navs[ni] && this.navs[ni]!.id === this.formNavId[i] ? this.navs[ni]! : null;
+        const lc = nav ? navCell(nav, cur) : -1;
+        const ld = lc >= 0 ? nav!.dir[lc] : 255; // hướng nav cục bộ về tâm khối (8 = đang ở ô tâm)
+        const d = f.dir[cur];
+        let moved: boolean;
+        // Nhìn thẳng thấy ô → đi thẳng vào ô. Đã đi thẳng thì giữ nguyên (tránh dao động giữa
+        // "về tâm khối" và "vào ô"); dò đường thẳng thưa dần theo khoảng cách cho nhẹ.
+        const noShort = this.time < this.formNoShort[i];
+        if (noShort) {
+          this.formDirect[i] = 0;
+        } else if (this.formDirect[i]) {
+          if ((i + this.tick) % 4 === 0 && !this.clearLine(i, gx, gy)) this.formDirect[i] = 0;
+        } else if (distToSlot < 150 || ld === 8 || d === DIR_GOAL ||
+                   (distToSlot < 1600 && (i + this.tick) % 8 === 0)) {
+          if (this.clearLine(i, gx, gy)) this.formDirect[i] = 1;
+        }
+        if (this.formDirect[i]) {
+          moved = this.steerTo(i, gx, gy, sp, d);
+        } else if (ld !== 255 && noShort) {
+          if (ld === 8) moved = this.steerTo(i, gx, gy, sp, d);
+          else moved = this.stepDir(i, cur, ld, sp);
+        } else if (ld !== 255) {
+          // Gần khối nhưng ô bị che (sau vách, vòng quanh cao nguyên...): đi tới ô dẫn đường xa nhất
+          // nhìn thấy được trên đường ngắn nhất tâm khối → ô. Tính lại định kỳ hoặc khi đã tới ô dẫn đường.
+          let wp = this.formWp[i];
+          const reached = wp >= 0 && Math.hypot((wp % MW) * T + 32 - this.x[i], ((wp / MW) | 0) * T + 32 - this.y[i]) < 20;
+          if (reached || (i + this.tick) % (wp < 0 ? 4 : 16) === 0) wp = this.formWp[i] = this.slotWaypoint(i, nav!, gx, gy);
+          if (wp >= 0) moved = this.steerTo(i, (wp % MW) * T + 32, ((wp / MW) | 0) * T + 32, sp, d);
+          else if (ld === 8) moved = this.steerTo(i, gx, gy, sp, d);
+          else moved = this.stepDir(i, cur, ld, sp);
+        } else if (d !== DIR_NONE && d !== DIR_GOAL) {
+          moved = this.stepDir(i, cur, d, sp); // chặng xa: trường lực chung
+        } else {
+          // ngoài cả hai (bị đẩy lệch ra): nhắm thẳng tâm khối
+          moved = this.steerTo(i, this.formTargetX[i], this.formTargetY[i], sp, d);
+        }
 
-        if (this.stuck[i] > 1.3) {
+        if (this.field[i] >= 0) {
+          // Kẹt = không nhúc nhích được, hoặc đã sát ô mà không lại gần thêm (bị đám đông chắn).
+          const NEAR = 120;
+          let progress = moved;
+          if (distToSlot < NEAR) {
+            progress = distToSlot < this.formBest[i] - 2;
+            if (progress) this.formBest[i] = distToSlot;
+          }
+          if (progress) this.stuck[i] = 0;
+          else this.stuck[i] += dt;
+          // Giằng co trong phạm vi khối: vẫn "đi" nhưng 4 giây không rời chỗ cũ quá 1/2 ô.
+          // (Ngoài phạm vi khối thì không tính — có thể đang xếp hàng qua cầu/dốc.)
+          const fromCenter = Math.hypot(this.formTargetX[i] - this.x[i], this.formTargetY[i] - this.y[i]);
+          const inBlock = distToSlot < NEAR || fromCenter < Math.hypot(this.formDX[i], this.formDY[i]) + 150;
+          // Ngoài phạm vi khối mà 6 giây không rời chỗ quá 1/2 ô (dao động ở mép địa hình): tạm bỏ
+          // đi tắt, bám đúng đường tìm được 4 giây — đường này luôn tiến dần về đích nên không lặp.
+          let stalled = false;
+          // Đang hành quân mà bị đánh và bị chặn đứng (kẹt giữa quân địch): quay sang đánh trả,
+          // vẫn giữ lệnh — hết địch thì đi tiếp vào ô đội hình.
+          // Tới khu đội hình rồi mà bị đánh, hoặc bị đánh từ PHÍA TRƯỚC (đang hành quân lao vào quân địch,
+          // không phải rút lui): cũng đánh trả. Bị đánh từ phía sau (đang rút) thì vẫn chạy như cũ.
+          if (this.moveMode[i] === MOVE_MARCH && this.time - this.lastCombat[i] < 1) {
+            const hb = this.lastHitBy[i];
+            const ahead = hb >= 0 && this.alive[hb] &&
+              (this.x[hb] - this.x[i]) * (gx - this.x[i]) + (this.y[hb] - this.y[i]) * (gy - this.y[i]) > 0;
+            const blocked = this.time - this.stallT[i] > 2 && Math.hypot(this.x[i] - this.stallX[i], this.y[i] - this.stallY[i]) < T / 2;
+            if (inBlock || ahead || blocked) this.moveMode[i] = MOVE_ATTACK;
+          }
+          if (this.time - this.stallT[i] > (inBlock ? 4 : 6)) {
+            const still = Math.hypot(this.x[i] - this.stallX[i], this.y[i] - this.stallY[i]) < T / 2;
+            if (still && inBlock && !noShort) { this.formNoShort[i] = this.time + 4; }
+            else if (still && inBlock) stalled = true;
+            else if (still) this.formNoShort[i] = this.time + 4;
+            this.stallX[i] = this.x[i];
+            this.stallY[i] = this.y[i];
+            this.stallT[i] = this.time;
+          }
+          if (stalled || this.stuck[i] > (distToSlot < NEAR ? 3 : 2)) {
             this.arrive(i); // kẹt quá lâu -> dừng lại (fail-safe)
             this.stuck[i] = 0;
+          } else {
+            this.state[i] = S_MOVE;
+            this.setAnim(i, this.runAnim(i));
+            // Trong phạm vi khối: không tách khỏi lính đã đứng hàng, để len được vào chỗ của mình
+            if (!inBlock) this.separate(i);
             return;
+          }
         }
-
-        this.state[i] = S_MOVE;
-        this.setAnim(i, this.runAnim(i));
-        this.separate(i);
+      }
+    }
+    // --- thợ bắc cầu: tới mũi cầu rồi đứng lát (đếm công cho updateBridges)
+    const bk = this.buildTask[i];
+    if (bk >= 0) {
+      const br = this.builtBridges[bk];
+      if (!br || !br.alive || br.done) this.buildTask[i] = -1;
+      else {
+        const [sx, sy] = this.bridgeStand(br, i);
+        const d = Math.hypot(sx - this.x[i], sy - this.y[i]);
+        if (d > 14) {
+          const sp = st.speed * this.moveMul(i) * tileSpeed(this.m, this.tile[i]) * dt;
+          if (this.steerTo(i, sx, sy, sp, DIR_NONE)) {
+            this.stuck[i] = 0;
+            this.state[i] = S_MOVE;
+            this.setAnim(i, this.runAnim(i));
+          } else if ((this.stuck[i] += dt) > 4) { this.buildTask[i] = -1; this.stuck[i] = 0; }
+        } else {
+          this.state[i] = S_IDLE;
+          this.face[i] = br.dir;
+          if (this.animDone(i) || this.anim[i] === this.runAnim(i)) this.setAnim(i, this.idleAnim(i));
+        }
+        if (d < 1.6 * T) this.bridgeCrew[bk]++;
+        this.anchorX[i] = this.x[i];
+        this.anchorY[i] = this.y[i];
         return;
       }
     }
@@ -1686,6 +2194,21 @@ export class World {
     const a = this.anim[i];
     const ad = ANIMS[a];
     if (ad.loop || this.animDone(i)) this.setAnim(i, this.idleAnim(i));
+    // Đứng hàng: bị lính khác len qua đẩy lệch khỏi chỗ thì từ từ về lại điểm neo
+    // (không làm khi vừa đánh / vừa có mục tiêu — giữa trận mà kéo về chỗ cũ thì lính đi qua đi lại, bỏ đánh)
+    const ax = this.anchorX[i] - this.x[i], ay = this.anchorY[i] - this.y[i];
+    const ad2 = ax * ax + ay * ay;
+    const calm = this.zoneR[i] === 0 && this.time - this.lastCombat[i] > 6 && this.time - this.lastTargetT[i] > 6;
+    if (calm && ad2 > 10 * 10 && ad2 < 150 * 150 && (i + this.tick) % 2 === 1) {
+      const d = Math.sqrt(ad2);
+      const sp = Math.min(d - 4, st.speed * 0.6 * this.moveMul(i) * tileSpeed(this.m, this.tile[i]) * dt * 2);
+      if (this.tryMove(i, (ax / d) * sp, (ay / d) * sp) && d > 24) {
+        this.state[i] = S_MOVE;
+        this.face[i] = ax > 0 ? 1 : -1;
+        this.setAnim(i, this.runAnim(i));
+      }
+      return;
+    }
     if ((i + this.tick) % 2 === 0) this.separate(i);
   }
 
@@ -1754,8 +2277,27 @@ export class World {
       // Bị bao vây: sát thương -30%
       finalDmg *= 0.7;
     }
-    if (tg >= 0) this.damage(tg, finalDmg, s, t, i);
-    else if (bt >= 0) this.damageBuilding(bt, finalDmg, s);
+    // Trúng đòn ở giữa hoạt ảnh vung (WINDUP), không phải lúc bắt đầu vung
+    this.hitTg[i] = tg >= 0 ? tg : bt >= 0 ? -2 - bt : -1;
+    this.hitDmg[i] = finalDmg;
+    this.hitAt[i] = this.time + WINDUP[t];
+    if (WINDUP[t] <= 0) this.resolveHit(i);
+  }
+
+  // Áp đòn cận chiến đã vung. Mục tiêu đã chết / chạy ra khỏi tầm (+ dung sai) thì đòn trượt.
+  private resolveHit(i: number) {
+    const h = this.hitTg[i];
+    this.hitTg[i] = -1;
+    if (h === -1) return;
+    const reach = STATS[this.type[i]].range + 14 + RANGE_HYST + 16;
+    if (h >= 0) {
+      if (!this.alive[h] || Math.hypot(this.x[h] - this.x[i], this.y[h] - this.y[i]) > reach) return;
+      this.damage(h, this.hitDmg[i], this.side[i], this.type[i], i);
+    } else {
+      const bt = -2 - h;
+      if (!this.bTargetAlive(bt)) return;
+      this.damageBuilding(bt, this.hitDmg[i], this.side[i]);
+    }
   }
 
   private updateArrows(dt: number) {

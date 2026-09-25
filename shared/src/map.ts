@@ -14,6 +14,7 @@ import {
   RAMP_R_TOP,
   SPAWN_W,
   SPEED_FORD,
+  SPEED_SWIM,
   T,
   WATER,
   WORLD_H,
@@ -114,12 +115,20 @@ export function passable(m: GameMap, i: number): boolean {
 }
 
 export function tileSpeed(m: GameMap, i: number): number {
-  return m.ground[i] === FORD ? SPEED_FORD : 1;
+  const g = m.ground[i];
+  return g === FORD ? SPEED_FORD : g === WATER ? SPEED_SWIM : 1;
+}
+
+// Nước sâu: bơi được (chỉ khi lính có lệnh Bơi qua sông, hoặc đang ở dưới nước — để luôn lên bờ được).
+export function swimmable(m: GameMap, i: number): boolean {
+  return m.ground[i] === WATER || passable(m, i);
 }
 
 // Elevation rule: same level, or one level apart when the lower tile is a ramp.
-export function canStep(m: GameMap, a: number, b: number): boolean {
-  if (!passable(m, a) || !passable(m, b)) return false;
+// swim = cho phép bước vào/ra nước sâu.
+export function canStep(m: GameMap, a: number, b: number, swim = false): boolean {
+  if (swim) { if (!swimmable(m, a) || !swimmable(m, b)) return false; }
+  else if (!passable(m, a) || !passable(m, b)) return false;
   const la = m.level[a];
   const lb = m.level[b];
   if (la === lb) return true;

@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import {
-  BIG_ARMY, CAP_ENEMY_T, CAP_NEUTRAL_T, CROWD_LIMIT, MELEE_CAP, PRESTIGE_WIN, SURRENDER_FRAC, TIME_LIMIT,
+  BIG_ARMY, BRIDGE_CREW_CAP, CAP_ENEMY_T, CAP_NEUTRAL_T, CROWD_LIMIT, MAX_BUILT_BRIDGES, MELEE_CAP, PRESTIGE_WIN, SPEED_SWIM, SURRENDER_FRAC, TIME_LIMIT,
 } from "@game/shared";
 
 const TABS = ["Mục tiêu", "Uy thế", "Ra lệnh", "Giao tranh", "Rút & Truy kích", "Mẹo"] as const;
@@ -77,10 +77,11 @@ export function HowToPlay({ onClose }: { onClose: () => void }) {
               <Ul>
                 <li><b>Kéo chuột trái</b>: chọn quân · <b>1–5</b>: chọn theo binh chủng · <b>Q</b>: cả đạo quân · <b>Esc</b>: bỏ chọn.</li>
                 <li><b>Chuột phải = Hành quân</b>: đi tới đích, <b>bỏ qua địch</b> trên đường. Dùng để rút lui hoặc cơ động.</li>
-                <li><b>F rồi chuột phải</b> (hoặc <b>Alt + chuột phải</b>) = <b>Tấn công</b>: đánh mọi địch gặp trên đường. Ra lệnh Tấn công lại cho quân đang đánh thì chúng vẫn giữ mục tiêu.</li>
+                <li><b>F rồi chuột phải</b> (hoặc <b>Alt + chuột phải</b>) = <b>Tấn công</b>: đánh mọi địch gặp trên đường; quanh điểm bấm là <b>vùng chiến đấu 12 ô</b> — lính tự chọn chỗ đánh, không dàn trận, đánh xong đứng tại chỗ.</li>
+                <li><b>Tiếp viện tự động</b>: quân ta bị đánh ở đâu thì lính đang rảnh trong khoảng ~10 ô quanh đó tự lao vào giúp (trừ quân đang Giữ vị trí hoặc đang có lệnh khác). Hết giao chiến 6 giây thì thôi.</li>
                 <li>Tới nơi, quân tự xếp đội hình <b>quay mặt về hướng tiến quân</b>, mặt trận rộng gấp ~2 chiều sâu, lính đi đầu đứng hàng đầu.</li>
                 <li><b>H</b> = Giữ vị trí: đứng yên, chỉ nhận 60% sát thương.</li>
-                <li><b>T</b> = đổi tư thế <b>Phòng thủ</b> (đuổi tối đa 8 ô rồi tự quay về) ⇄ <b>Truy kích</b> (đuổi tới cùng).</li>
+                <li><b>T</b> = đổi tư thế <b>Phòng thủ</b> (chỉ đánh địch trong vùng 8 ô quanh chỗ đứng, hoặc kẻ đang đánh mình; đuổi quá 8 ô thì tự quay về) ⇄ <b>Truy kích</b> (đuổi tới cùng).</li>
                 <li><b>G</b> = Quay đầu phản công (xem tab Rút & Truy kích).</li>
                 <li><b>WASD / kéo chuột phải / chuột giữa</b>: di chuyển camera · <b>lăn chuột</b>: phóng to.</li>
               </Ul>
@@ -103,6 +104,13 @@ export function HowToPlay({ onClose }: { onClose: () => void }) {
                 <li><b>Bao vây</b>: bị kẹp hai phía bởi quân đông hơn 1,5 lần → gây −30%, nhận +20% sát thương. Lính bị bao vây và máu thấp có thể <b>Cuồng chiến</b> (×2 sát thương).</li>
                 <li><b>Rừng</b>: quân trong rừng bị ẩn với địch; đánh từ rừng khi chưa bị phát hiện thì đòn đầu ×1,5; nghỉ 8 giây trong rừng hồi 1% máu/giây.</li>
                 <li><b>Giữ vị trí</b> (H): chỉ nhận 60% sát thương — rất mạnh khi chặn cầu.</li>
+              </Ul>
+              <H>Vượt sông bất ngờ</H>
+              <Ul>
+                <li><b>Bơi qua sông</b> (V rồi chuột phải vào bờ bên kia): đi thẳng qua nước sâu nhưng chỉ {SPEED_SWIM}x tốc độ, <b>không đánh được</b> khi đang bơi và nhận thêm 50% sát thương. Hợp để đánh úp nhóm nhỏ, không nên đưa cả đạo quân.</li>
+                <li><b>Bắc cầu</b> (B rồi chuột phải vào lòng sông): quân nào cũng làm thợ được, tối đa {BRIDGE_CREW_CAP} thợ cùng lát. Mỗi phe có tối đa <b>{MAX_BUILT_BRIDGES} cầu tự xây</b>; cầu bị phá thì được xây lại.</li>
+                <li>Cầu tự xây có máu, địch tới gần sẽ tự phá. Cầu sập thì lính trên cầu rơi xuống nước và phải bơi vào bờ. Quân địch cũng đi qua cầu của bạn được.</li>
+                <li>Cầu phụ và quân bơi <b>không</b> tính là đầu cầu: cờ nội địa vẫn chỉ cho điểm khi giữ 5 chỗ vượt sông gốc. Dùng để đánh vòng sau lưng, cắt đầu cầu địch, phá công trình, cướp kho lương.</li>
               </Ul>
             </>
           )}
@@ -133,6 +141,7 @@ export function HowToPlay({ onClose }: { onClose: () => void }) {
               <li>Cả hai phe mất ~2,5 phút mới chạm nhau ở sông. Gửi <b>Thương kỵ</b> (nhanh nhất) đi chiếm bãi cạn trước.</li>
               <li>Đừng dồn cả đạo quân vào một cầu — cầu bắc và cầu nam cách nhau ~5,5 phút đi bộ.</li>
               <li>Thua trên sông? Vượt bãi cạn cắm cờ trong nội địa địch (+1/s mỗi cờ) để buộc địch chia quân.</li>
+              <li>Bắc cầu phụ ở đoạn sông không ai canh để đưa quân ra sau lưng đội đang giữ cầu của địch — rồi phá cầu đó trước khi địch dùng lại.</li>
               <li>Chiếm cao nguyên đầu cầu cho Cung thủ: +2 ô tầm bắn, +3 ô tầm nhìn.</li>
               <li>Dùng Trinh sát soi rừng trước khi cho quân đi qua. Trinh sát đứng 5 giây trên đỉnh cờ địch sẽ làm mù tầm nhìn của cờ đó 60 giây.</li>
               <li>Chỉ bật Truy kích cho Thương kỵ — nhanh nhất nên dễ đuổi kịp và rút về.</li>

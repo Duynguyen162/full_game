@@ -70,51 +70,56 @@ class Heap {
 }
 
 // Diagonal moves require both orthogonal detours to be legal (no corner cutting past cliffs).
-function stepOk(m: GameMap, from: number, d: number): boolean {
+function stepOk(m: GameMap, from: number, d: number, swim = false): boolean {
   const x = from % MW;
   const y = (from / MW) | 0;
   const nx = x + DX[d];
   const ny = y + DY[d];
   if (nx < 0 || ny < 0 || nx >= MW || ny >= MH) return false;
   const to = ny * MW + nx;
-  if (!canStep(m, from, to)) return false;
+  if (!canStep(m, from, to, swim)) return false;
   if (d & 1) {
     const a = y * MW + nx;
     const b = ny * MW + x;
-    if (!canStep(m, from, a) || !canStep(m, a, to)) return false;
-    if (!canStep(m, from, b) || !canStep(m, b, to)) return false;
+    if (!canStep(m, from, a, swim) || !canStep(m, a, to, swim)) return false;
+    if (!canStep(m, from, b, swim) || !canStep(m, b, to, swim)) return false;
   }
   return true;
 }
 
 // Bảng hướng đi được: bit d của mask[i] = stepOk(m, i, d). Tính một lần cho mỗi bản đồ
 // (stepOk gọi canStep tới 5 lần cho mỗi hướng chéo — là phần nặng nhất của Dijkstra).
+// swim = mặt nạ cho lệnh Bơi qua sông (nước sâu đi được, chậm).
 const navCache = new WeakMap<GameMap, Uint8Array>();
+const navCacheSwim = new WeakMap<GameMap, Uint8Array>();
 
-export function navMask(m: GameMap): Uint8Array {
-  let mask = navCache.get(m);
+export function navMask(m: GameMap, swim = false): Uint8Array {
+  const cache = swim ? navCacheSwim : navCache;
+  let mask = cache.get(m);
   if (!mask) {
     mask = new Uint8Array(N);
     for (let i = 0; i < N; i++) {
       let b = 0;
-      for (let d = 0; d < 8; d++) if (stepOk(m, i, d)) b |= 1 << d;
+      for (let d = 0; d < 8; d++) if (stepOk(m, i, d, swim)) b |= 1 << d;
       mask[i] = b;
     }
-    navCache.set(m, mask);
+    cache.set(m, mask);
   }
   return mask;
 }
 
 // Gọi khi địa hình đổi (công trình bị phá): tính lại mask trong hình chữ nhật (+1 ô viền).
 export function invalidateNav(m: GameMap, x0: number, y0: number, x1: number, y1: number) {
-  const mask = navCache.get(m);
-  if (!mask) return;
-  for (let y = Math.max(0, y0 - 1); y <= Math.min(MH - 1, y1 + 1); y++) {
-    for (let x = Math.max(0, x0 - 1); x <= Math.min(MW - 1, x1 + 1); x++) {
-      const i = y * MW + x;
-      let b = 0;
-      for (let d = 0; d < 8; d++) if (stepOk(m, i, d)) b |= 1 << d;
-      mask[i] = b;
+  for (const swim of [false, true]) {
+    const mask = (swim ? navCacheSwim : navCache).get(m);
+    if (!mask) continue;
+    for (let y = Math.max(0, y0 - 1); y <= Math.min(MH - 1, y1 + 1); y++) {
+      for (let x = Math.max(0, x0 - 1); x <= Math.min(MW - 1, x1 + 1); x++) {
+        const i = y * MW + x;
+        let b = 0;
+        for (let d = 0; d < 8; d++) if (stepOk(m, i, d, swim)) b |= 1 << d;
+        mask[i] = b;
+      }
     }
   }
 }
@@ -139,12 +144,12 @@ let nextId = 1;
 
 // `sources` (tùy chọn): các ô đang có lính nhận lệnh. Khi đã có, Dijkstra dừng sớm
 // sau khi phủ hết các ô này (+25% và 24 ô dự phòng) thay vì quét toàn bản đồ 512×512.
-export function buildFlowField(m: GameMap, tx: number, ty: number, radius: number, sources?: ArrayLike<number>): FlowField | null {
+export function buildFlowField(m: GameMap, tx: number, ty: number, radius: number, sources?: ArrayLike<number>, swim = false): FlowField | null {
   const start = nearestPassable(m, tx, ty);
   if (start < 0) return null;
   const sx = start % MW;
   const sy = (start / MW) | 0;
-  const nav = navMask(m);
+  const nav = navMask(m, swim);
   const cost = new Float32Array(N).fill(Infinity);
   const heap = new Heap();
   // goal area: tiles within radius reachable from the start tile without leaving the area

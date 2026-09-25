@@ -10,7 +10,7 @@
 // - Kỵ binh chỉ truy kích quân đang rút khi không có rừng gần đó (tránh bị dụ vào phục kích).
 // - Ra lệnh qua hàng đợi, tối đa 1 trường lực mỗi 0.3s để không làm giật khung hình.
 import { ARCHER, LANCER, MONK, PAWN, WARRIOR } from "./assets-def";
-import { MH, MW, PRESTIGE_WIN, STANCE_DEFEND, STANCE_PURSUE, T } from "./constants";
+import { MAX_BUILT_BRIDGES, MH, MW, PRESTIGE_WIN, STANCE_DEFEND, STANCE_PURSUE, T, WATER } from "./constants";
 import { passable } from "./map";
 import { OBJ_FLAG, OBJ_RIVER } from "./objectives";
 import { MOVE_ATTACK, MOVE_MARCH, STATS, type World } from "./world";
@@ -22,7 +22,12 @@ const THINK_DT = 1.0;
 const ORDER_DT = 0.3;
 
 type Role = "line" | "cav" | "scout";
-type State = "advance" | "contain" | "hold" | "withdraw" | "regroup" | "pursue" | "raid" | "respond" | "assault";
+type State = "advance" | "contain" | "hold" | "withdraw" | "regroup" | "pursue" | "raid" | "respond" | "assault"
+  | "depot"   // đi lấy Kho lương
+  | "bridge"  // đang cho một toán thợ bắc cầu vòng sườn (phần còn lại chốt đầu cầu)
+  | "flank";  // qua cầu vòng sườn, đánh vào sau lưng quân địch đang giữ chỗ vượt sông
+// Trạng thái đánh chủ động: ra lệnh Tấn công kiểu vùng chiến đấu (không dàn trận)
+const LOOSE_STATES: State[] = ["assault", "respond", "pursue", "raid", "depot", "flank"];
 
 interface Squad {
   name: string;
@@ -35,9 +40,13 @@ interface Squad {
   task: number;            // mục tiêu đột kích / ứng cứu
   braced: boolean;         // đã cho bộ binh Giữ vị trí
   until: number;           // hạn của trạng thái truy kích / trinh sát lánh mặt
+  depot: number;           // chỉ số kho lương đang đi lấy (-1 = không)
+  crew: number[];          // thợ đang bắc cầu (tách khỏi units để lệnh của đội không huỷ việc bắc cầu)
+  bridge: number;          // id cầu tự xây đang làm / vừa làm (-1 = không)
+  flank: number;           // 0 = đang qua cầu, 1 = đang đánh vào sau lưng
 }
 
-interface Order { key: string; units: number[]; tx: number; ty: number; mode: number }
+interface Order { key: string; units: number[]; tx: number; ty: number; mode: number; loose: boolean }
 
 // Phản ứng cấp toàn quân trước một đạo quân lớn ("dồn cục") của địch
 type ArmyMode = "normal" | "converge" | "engage" | "evade";
@@ -88,6 +97,7 @@ export class AICommander {
     // river[0..4] = cầu bắc, bãi cạn bắc, cầu giữa, bãi cạn nam, cầu nam
     const mk = (name: string, role: Role, units: number[], post: number): Squad => ({
       name, role, units, initStr: this.strength(units), post, state: "advance", stateT: 0, task: -1, braced: false, until: 0,
+      depot: -1, crew: [], bridge: -1, flank: 0,
     });
     this.squads = [
       mk("Chủ lực giữa", "line", [...wC, ...aC, ...mC], river[2]),
@@ -227,7 +237,7 @@ export class AICommander {
 
   // ------------------------------------------------------------ ra lệnh
 
-  private issue(key: string, units: number[], tx: number, ty: number, mode: number, force = false) {
+  private issue(key: string, units: number[], tx: number, ty: number, mode: number, force = false, loose = false) {
     const live = units.filter((i) => this.w.alive[i]);
     if (!live.length) return;
     const l = this.last.get(key);
@@ -235,7 +245,7 @@ export class AICommander {
     // cùng đích: chỉ ra lại khi quân đã dừng hẳn ở xa đích (bị kéo lệch / mất trường lực), tối đa 12s/lần
     if (same && !force && !(this.w.time - l.t > 12 && this.stalled(live, tx, ty))) return;
     this.queue = this.queue.filter((q) => q.key !== key);
-    this.queue.push({ key, units: live, tx: Math.round(tx), ty: Math.round(ty), mode });
+    this.queue.push({ key, units: live, tx: Math.round(tx), ty: Math.round(ty), mode, loose });
     this.last.set(key, { tx, ty, mode, t: this.w.time });
   }
 
@@ -250,7 +260,7 @@ export class AICommander {
   private flush() {
     if (!this.queue.length || this.w.time < this.nextOrder) return;
     const q = this.queue.shift()!;
-    this.w.orderMove(q.units.filter((i) => this.w.alive[i]), q.tx, q.ty, q.mode);
+    this.w.orderMove(q.units.filter((i) => this.w.alive[i] && this.w.buildTask[i] < 0), q.tx, q.ty, q.mode, false, q.loose);
     this.nextOrder = this.w.time + ORDER_DT;
   }
 
@@ -266,29 +276,40 @@ export class AICommander {
   }
 
   // Đưa đội tới (tx, ty): bộ binh + tu sĩ ở trước, cung thủ lùi 5 ô về phía nhà.
+  // Trạng thái đánh chủ động (LOOSE_STATES) + Tấn công → vùng chiến đấu: lính tự chọn chỗ đánh, không dàn trận.
   private moveSquad(sq: Squad, tx: number, ty: number, mode: number, force = false) {
+    const loose = mode === MOVE_ATTACK && LOOSE_STATES.includes(sq.state);
     if (sq.role === "line") {
       const melee = sq.units.filter((i) => this.w.type[i] !== ARCHER);
       const ranged = sq.units.filter((i) => this.w.type[i] === ARCHER);
-      this.issue(`${sq.name}/m`, melee, tx, ty, mode, force);
+      this.issue(`${sq.name}/m`, melee, tx, ty, mode, force, loose);
       const back = this.w.obj[sq.post].kind === OBJ_FLAG && mode !== MOVE_MARCH ? 0 : 5;
-      this.issue(`${sq.name}/r`, ranged, tx + this.dir * back, ty, mode, force);
-    } else this.issue(sq.name, sq.units, tx, ty, mode, force);
+      this.issue(`${sq.name}/r`, ranged, tx + this.dir * back, ty, mode, force, loose);
+    } else this.issue(sq.name, sq.units, tx, ty, mode, force, loose);
+  }
+
+  private forget(sq: Squad) {
+    this.last.delete(`${sq.name}/m`);
+    this.last.delete(`${sq.name}/r`);
+    this.last.delete(sq.name);
   }
 
   // ------------------------------------------------------------ kế hoạch
 
   private plan() {
     const w = this.w, s = this.side, e = 1 - s;
-    for (const sq of this.squads) sq.units = sq.units.filter((i) => w.alive[i]);
+    for (const sq of this.squads) { sq.units = sq.units.filter((i) => w.alive[i]); sq.crew = sq.crew.filter((i) => w.alive[i]); }
     this.mergeWeak();
     const myAlive = w.combatAlive(s), enAlive = w.combatAlive(e);
     const assault = w.time > 240 && myAlive > enAlive * 1.7;
     const desperate = w.prestige[e] > PRESTIGE_WIN * 0.7 && w.prestige[e] > w.prestige[s] + 60;
     this.updateArmy();
+    this.planDepots();
     for (const sq of this.squads) {
+      if (sq.crew.length && sq.state !== "bridge") this.mergeCrew(sq); // bị kéo sang việc khác → gọi thợ về
       if (!sq.units.length) continue;
-      if (sq.role !== "scout" && this.armyOverride(sq)) continue;
+      if (sq.role !== "scout" && this.armyOverride(sq)) { sq.depot = -1; continue; }
+      if (sq.state === "depot" && this.runDepot(sq)) continue;
       if (sq.role === "line") this.planLine(sq, assault, desperate);
       else if (sq.role === "cav") this.planCav(sq, desperate);
     }
@@ -451,6 +472,16 @@ export class AICommander {
       }
     }
 
+    // Đội đang tiến quân / giữ trận:
+    //  - đứng ở mặt trận (≤ 18 ô) mà địch vẫn giữ chỗ vượt sông trước mặt quá 45 giây → bắc cầu vòng sườn
+    //  - mình giữ được chỗ vượt sông, quanh đội yên ổn → tách một toán đi cắm cờ nội địa địch
+    //    (cờ chỉ cho điểm khi có đầu cầu)
+    if (sq.state === "advance" || sq.state === "hold") {
+      if (w.objOwner[sq.post] !== s) {
+        if (now - sq.stateT > 45 && Math.hypot(c[0] - fx, c[1] - fy) < 18) this.tryBridge(sq, my);
+      } else if (now > 150 && this.visibleNear(c[0], c[1], 12).length < 6) this.tryFlagParty(sq, my);
+    }
+
     switch (sq.state) {
       case "assault":
       case "respond":
@@ -475,7 +506,44 @@ export class AICommander {
         if (local > my * 1.6) { this.setState(sq, "withdraw", "bị tấn công mạnh ở đầu cầu → rút"); break; }
         this.moveSquad(sq, sx, sy, MOVE_ATTACK);
         // thế địch yếu đi (bị rút quân đi nơi khác / bị tiêu hao) → tiến lên
-        if (now - sq.stateT > 8 && this.enemyNear(fx, fy, 10) < my * 1.05) this.setState(sq, "advance", `địch ở ${o.label} yếu đi → tiến công`);
+        if (now - sq.stateT > 8 && this.enemyNear(fx, fy, 10) < my * 1.05) { this.setState(sq, "advance", `địch ở ${o.label} yếu đi → tiến công`); break; }
+        // chốt lâu mà địch vẫn giữ chặt → bắc cầu vòng sườn ở đoạn sông vắng
+        if (now - sq.stateT > 20) this.tryBridge(sq, my);
+        break;
+      }
+      case "bridge": {
+        const br = w.builtBridges[sq.bridge];
+        const o = w.obj[sq.post];
+        if (!br || !br.alive || now - sq.stateT > 150 || local > my * 1.6) {
+          const why = !br || !br.alive ? "cầu vòng sườn bị phá → quay lại chốt đầu cầu"
+            : local > my * 1.6 ? "bị tấn công mạnh → bỏ bắc cầu, rút" : "bắc cầu quá lâu → bỏ dở";
+          this.mergeCrew(sq);
+          this.setState(sq, local > my * 1.6 ? "withdraw" : "contain", why);
+          break;
+        }
+        if (br.done) {
+          this.mergeCrew(sq);
+          sq.flank = 0;
+          this.setState(sq, "flank", `bắc xong cầu vòng sườn → qua sông đánh sau lưng quân giữ ${o.label}`);
+          break;
+        }
+        this.moveSquad(sq, fx, fy, MOVE_ATTACK); // phần còn lại vẫn giữ đầu cầu phía mình
+        break;
+      }
+      case "flank": {
+        const br = w.builtBridges[sq.bridge];
+        const o = w.obj[sq.post];
+        if (w.objOwner[sq.post] === s || now - sq.stateT > 180) { this.setState(sq, "advance", `vòng sườn xong, về giữ ${o.label}`); break; }
+        if (my < sq.initStr * 0.35 || local > my * 1.5) { this.setState(sq, "withdraw", "vòng sườn thất bại → rút"); break; }
+        if (sq.flank === 0 && br) {
+          // đầu cầu phía địch
+          const ex = br.dir > 0 ? br.xb + 8 : br.xa - 8, ey = (br.y0 + br.y1) >> 1;
+          this.moveSquad(sq, ex, ey, MOVE_ATTACK);
+          if (Math.hypot(c[0] - ex, c[1] - ey) < 9 || !br.alive) { sq.flank = 1; this.forget(sq); }
+        } else {
+          // đánh vào quân địch ở phía bên kia chỗ vượt sông (sau lưng chúng)
+          this.moveSquad(sq, o.tx - this.dir * 8, o.ty, MOVE_ATTACK);
+        }
         break;
       }
       case "hold": {
@@ -528,6 +596,157 @@ export class AICommander {
       default:
         this.setState(sq, "advance");
     }
+  }
+
+  // ------------------------------------------------------------ toán cắm cờ
+
+  // Đội chủ lực đang giữ đầu cầu tách ~35% bộ binh + một ít cung thủ thành toán cắm cờ. Toán này chạy
+  // theo logic đột kích của kỵ binh (planCav: raid → cắm xong đánh tiếp cờ khác / gặp địch mạnh thì rút).
+  private flagParties = 0;
+  private tryFlagParty(sq: Squad, my: number) {
+    const w = this.w;
+    if (this.squads.some((q) => q.name.startsWith("Toán cắm cờ") && q.units.length && q.post === sq.post)) return;
+    if (sq.units.length < 80 || my < sq.initStr * 0.25) return;
+    const c = this.centroid(sq.units)!;
+    const k = this.pickRaidTarget(c, my * 0.6, true);
+    if (k < 0 || w.obj[k].front !== w.obj[sq.post].front) return;
+    const melee = sq.units.filter((i) => w.type[i] === WARRIOR || w.type[i] === LANCER);
+    const ranged = sq.units.filter((i) => w.type[i] === ARCHER);
+    const party = [...melee.slice(0, Math.floor(melee.length * 0.35)), ...ranged.slice(0, Math.floor(ranged.length * 0.2))];
+    if (party.length < 25) return;
+    const set = new Set(party);
+    sq.units = sq.units.filter((i) => !set.has(i));
+    this.forget(sq);
+    const q: Squad = {
+      name: `Toán cắm cờ ${++this.flagParties}`, role: "cav", units: party, initStr: this.strength(party), post: sq.post,
+      state: "raid", stateT: w.time, task: k, braced: false, until: 0, depot: -1, crew: [], bridge: -1, flank: 0,
+    };
+    this.squads.push(q);
+    w.orderStance(party, STANCE_DEFEND);
+    this.log.push(`[${fmt(w.time)}] ${sq.name}: giữ được đầu cầu → tách ${party.length} quân đi cắm ${w.obj[k].label}`);
+    if (this.log.length > 12) this.log.shift();
+    this.sendScoutToBlind(k);
+  }
+
+  // ------------------------------------------------------------ bắc cầu vòng sườn
+
+  // Chỗ bắc cầu: đoạn sông cách chỗ vượt sông đang bị chốt 24–60 ô, bắc được, gần như không có địch
+  // trong 20 ô; gần nhất trước.
+  private findBridgeSpot(post: number, my: number): [number, number] | null {
+    const w = this.w, o = w.obj[post], m = w.m;
+    let best: [number, number] | null = null, bs = Infinity;
+    for (let off = 24; off <= 60; off += 2) for (const sgn of [1, -1]) {
+      const y = o.ty + sgn * off;
+      if (y < 6 || y > MH - 7) continue;
+      // dòng sông ở hàng này: dải nước sâu gần chỗ vượt sông nhất
+      let a = -1, b = -1;
+      for (let x = Math.max(0, o.tx - 30); x <= Math.min(MW - 1, o.tx + 30); x++) {
+        if (m.ground[y * MW + x] === WATER) { if (a < 0) a = x; b = x; } else if (a >= 0) break;
+      }
+      if (a < 0) continue;
+      const x = (a + b) >> 1;
+      if (!w.planBridge(this.side, x, y).ok) continue;
+      // phải thật vắng: bị thấy lúc đang xây là mất cầu (và mất lượt xây)
+      const g = this.enemyNear(x, y, 20);
+      if (g > 12) continue;
+      const sc = off + g * 4;
+      if (sc < bs) { bs = sc; best = [x, y]; }
+    }
+    return best;
+  }
+
+  private tryBridge(sq: Squad, my: number) {
+    const w = this.w, s = this.side;
+    if (this.squads.some((q) => q.state === "bridge")) return; // mỗi lúc chỉ một công trình
+    if (w.builtBridges.filter((b) => b.alive && b.side === s).length >= MAX_BUILT_BRIDGES) return;
+    if (sq.units.length < 60) return;
+    const spot = this.findBridgeSpot(sq.post, my);
+    if (!spot) return;
+    const [x, y] = spot;
+    let pool = sq.units.filter((i) => w.type[i] === WARRIOR);
+    if (pool.length < 12) pool = sq.units.filter((i) => w.type[i] !== ARCHER && w.type[i] !== MONK);
+    const crew = pool.sort((a, b) => Math.hypot(w.x[a] / T - x, w.y[a] / T - y) - Math.hypot(w.x[b] / T - x, w.y[b] / T - y) || a - b).slice(0, 24);
+    if (crew.length < 8) return;
+    const err = w.orderBuildBridge(crew, x, y);
+    if (err) return;
+    const set = new Set(crew);
+    sq.crew = crew;
+    sq.units = sq.units.filter((i) => !set.has(i));
+    sq.bridge = w.builtBridges.length - 1;
+    this.forget(sq);
+    this.setState(sq, "bridge", `${w.obj[sq.post].label} bị giữ chặt → bắc cầu vòng sườn tại (${x}, ${y})`);
+  }
+
+  private mergeCrew(sq: Squad) {
+    // cầu còn dở mà thợ bị gọi về → tháo bỏ để trả lại lượt xây (mỗi phe chỉ có 2 lượt)
+    if (sq.bridge >= 0) this.w.abandonBridge(sq.bridge);
+    if (!sq.crew.length) return;
+    sq.units.push(...sq.crew.filter((i) => this.w.alive[i]));
+    sq.crew = [];
+    this.forget(sq);
+  }
+
+  // ------------------------------------------------------------ kho lương
+
+  // Kho lương đang mở mà chưa đội nào đi lấy: giao cho đội rảnh gần nhất đủ sức (ưu tiên kỵ binh — nhanh,
+  // và không kéo chủ lực rời chỗ vượt sông). Không lấy nếu phải bỏ trống cứ điểm đang bị đe doạ.
+  private planDepots() {
+    const w = this.w;
+    w.depots.forEach((d, k) => {
+      if (d.claimed || d.expired || this.w.time - d.spawnT > 110) return;
+      if (this.squads.some((q) => q.state === "depot" && q.depot === k)) return;
+      const guard = this.enemyNear(d.tx, d.ty, 12);
+      // kho bên phần sân địch: địch cũng sẽ tới lấy → chỉ đi khi gần như không có ai canh
+      const enemyHalf = this.side === 0 ? d.tx >= MW / 2 : d.tx < MW / 2;
+      if (enemyHalf && (guard > 0 || this.w.time - d.spawnT < 40)) return;
+      let best: Squad | null = null, bs = Infinity;
+      for (const q of this.squads) {
+        if (!q.units.length || q.role === "scout") continue;
+        if (q.state !== "advance" && q.state !== "hold" && q.state !== "contain") continue;
+        const c = this.centroid(q.units);
+        if (!c) continue;
+        const my = this.strength(q.units);
+        const dist = Math.hypot(c[0] - d.tx, c[1] - d.ty);
+        if (q.role === "line" && dist > 60) continue;          // chủ lực chỉ lấy kho ngay gần
+        if (this.enemyNear(c[0], c[1], 12) > my * 0.25) continue; // đang giao chiến thì không rút đi lấy kho
+        if (dist > 150 || my < guard * 1.3 + 15) continue;
+        const [fx, fy] = this.front(q.post);
+        if (this.enemyNear(fx, fy, 12) > my * 0.5) continue;  // cứ điểm của đội đang bị đe doạ
+        const sc = dist + (q.role === "line" ? 40 : 0) + (enemyHalf ? 80 : 0);
+        if (sc < bs) { bs = sc; best = q; }
+      }
+      if (!best) return;
+      best.depot = k;
+      const bc = this.centroid(best.units)!;
+      best.until = Math.hypot(bc[0] - d.tx, bc[1] - d.ty); // khoảng cách lúc nhận việc (để biết có tiến triển không)
+      this.setState(best, "depot", `đi lấy Kho lương tại (${d.tx}, ${d.ty})`);
+    });
+  }
+
+  // Trả về true nếu đội vẫn đang lo việc lấy kho
+  private runDepot(sq: Squad): boolean {
+    const w = this.w, d = w.depots[sq.depot];
+    const c = this.centroid(sq.units)!;
+    if (!d || d.claimed || d.expired) {
+      sq.depot = -1;
+      this.setState(sq, "advance", d?.claimed ? "xong việc kho lương, về vị trí" : "kho lương đã hết hạn, về vị trí");
+      return false;
+    }
+    if (this.enemyNear(c[0], c[1], 12) > this.strength(sq.units) * 1.2) {
+      sq.depot = -1;
+      this.setState(sq, "withdraw", "gặp địch mạnh trên đường lấy kho → rút");
+      return false;
+    }
+    // 40 giây mà không lại gần kho hơn (bị cuốn vào trận / kẹt đường) → bỏ
+    const dist = Math.hypot(c[0] - d.tx, c[1] - d.ty);
+    if (this.w.time - sq.stateT > 40 && dist > sq.until * 0.8 && dist > 10) {
+      sq.depot = -1;
+      this.setState(sq, "advance", "không tới được kho lương, về vị trí");
+      return false;
+    }
+    // đường xa: hành quân (không sa vào đánh dọc đường); tới gần mới Tấn công để dọn chỗ và đứng giữ
+    this.moveSquad(sq, d.tx, d.ty, dist > 25 ? MOVE_MARCH : MOVE_ATTACK);
+    return true;
   }
 
   private nearestLines(objId: number, k: number) {
@@ -649,8 +868,10 @@ export class AICommander {
     }
     // chỉ đột kích khi thật sự lép vế — và bãi cạn của mình không đang bị đe doạ
     const behind = myRiver < enRiver || w.prestige[s] + 20 < w.prestige[e];
-    if (!raiding && !desperate && now > 180 && behind && my > sq.initStr * 0.5 && this.enemyNear(fx, fy, 12) < my * 0.5) {
-      const k = this.pickRaidTarget(c, my);
+    // Có đầu cầu ở mặt trận nào thì cờ địch ở mặt trận đó cho điểm (+1/giây) → đi cắm ngay, không đợi thua thế
+    const opening = this.pickRaidTarget(c, my, true) >= 0;
+    if (!raiding && !desperate && now > 150 && (behind || opening) && my > sq.initStr * 0.5 && this.enemyNear(fx, fy, 12) < my * 0.5) {
+      const k = this.pickRaidTarget(c, my, opening && !behind);
       if (k >= 0) {
         sq.task = k;
         this.setState(sq, "raid", `lép vế trên sông → đột kích ${w.obj[k].label}`);
@@ -692,14 +913,18 @@ export class AICommander {
     return best;
   }
 
-  private pickRaidTarget(c: [number, number], my: number) {
+  // Cờ địch để cắm: ít quân canh, gần; ưu tiên mặt trận mình đang có đầu cầu (cờ ở đó mới cho điểm).
+  // scoring = true → chỉ xét cờ ở mặt trận đang có đầu cầu.
+  private pickRaidTarget(c: [number, number], my: number, scoring = false) {
     const w = this.w, s = this.side, e = 1 - s;
     let best = -1, bs = Infinity;
     for (const o of w.obj) {
       if (o.kind !== OBJ_FLAG || o.home !== e || w.objOwner[o.id] === s) continue;
+      const bh = w.bridgehead[s][o.front];
+      if (scoring && !bh) continue;
       const guard = this.enemyNear(o.tx, o.ty, 20);
       if (guard > my * 0.4) continue;
-      const score = guard * 3 + Math.hypot(o.tx - c[0], o.ty - c[1]);
+      const score = guard * 3 + Math.hypot(o.tx - c[0], o.ty - c[1]) - (bh ? 40 : 0);
       if (score < bs) { bs = score; best = o.id; }
     }
     return best;
@@ -753,6 +978,7 @@ const ARMY_VI: Record<ArmyMode, string> = { normal: "thường", converge: "tậ
 const STATE_VI: Record<State, string> = {
   advance: "tiến quân", contain: "chốt đầu cầu", hold: "giữ trận", withdraw: "rút lui", regroup: "hồi sức", pursue: "truy kích",
   raid: "đột kích", respond: "ứng cứu", assault: "tổng tấn công",
+  depot: "lấy kho lương", bridge: "bắc cầu vòng sườn", flank: "đánh vòng sườn",
 };
 
 function fmt(t: number) {

@@ -158,3 +158,21 @@ body {
   font-weight: 900;
   letter-spacing: 0.03em;
 }
+
+/* Tín hiệu giao chiến trên thanh bản đồ nhỏ */
+@keyframes ts-pulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.45) drop-shadow(0 0 4px #ff3c28); }
+}
+.ts-game .ts-pulse { animation: ts-pulse 0.9s ease-in-out infinite; }
+
+/* Nút nhỏ trên thanh công cụ bản đồ */
+.ts-game .ts-btn.ts-sm {
+  border-width: 8px;
+  border-image-width: 8px;
+  min-height: 26px;
+  min-width: 26px;
+  padding: 0 2px 2px;
+  font-size: 12px;
+  line-height: 1;
+}
