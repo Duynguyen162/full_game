@@ -28,6 +28,7 @@ export default function Home() {
         onStartSinglePlayer={() => {
           setMode("ai");
           setSeed(Math.floor(Math.random() * 2147483647));
+          setPlayers([]); // Clear players for local AI mode to avoid ID mismatch in deployment
           setAppState("playing");
         }}
         onStartMultiplayer={(room, s, plist) => {

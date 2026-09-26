@@ -26,6 +26,7 @@ export interface ViewOptions {
   myId?: string;
   // Chủ sở hữu mục tiêu mà người xem biết được (cập nhật khi có tầm nhìn). null = dùng giá trị thật.
   objKnown?: Int8Array | null;
+  ownerColors?: Record<string, string>;
 }
 
 const UNIT_SCALE = 0.72;
@@ -397,13 +398,15 @@ export class Renderer {
       ctx.imageSmoothingEnabled = false;
       this.drawTerrain(ctx, tx0, ty0, tx1, ty1, time, true, false);
       this.drawBuiltBridges(ctx, w, opt, tx0, ty0, tx1, ty1, cam.zoom);
-      this.drawSorted(ctx, w, opt, presence, time, tx0, ty0, tx1, ty1, wx0, wy0, wx1, wy1);
+      this.drawSorted(ctx, w, opt, presence, time, tx0, ty0, tx1, ty1, wx0, wy0, wx1, wy1, cam.zoom);
       this.drawArrows(ctx, w, opt, wx0, wy0, wx1, wy1);
       this.drawFx(ctx, w, wx0, wy0, wx1, wy1);
     }
+    
     // ---- Sương mù: vẽ sau units, trước mây và UI
     this.drawFog(ctx, w, opt.viewer, wx0, wy0, wx1, wy1, dt);
     this.drawObjectives(ctx, w, opt, cam.zoom, wx0, wy0, wx1, wy1);
+    this.drawDepots(ctx, w, opt, cam.zoom, wx0, wy0, wx1, wy1);
     if (opt.showNav) this.drawNav(ctx, tx0, ty0, tx1, ty1);
     if (hoverTile >= 0 && ts >= 14) {
       ctx.strokeStyle = "rgba(255,255,255,0.8)";
@@ -537,6 +540,58 @@ export class Renderer {
     }
   }
 
+  // ---- V2: Vẽ Kho Lương (Depots)
+  private drawDepots(ctx: CanvasRenderingContext2D, w: World, opt: ViewOptions, zoom: number, wx0: number, wy0: number, wx1: number, wy1: number) {
+    const px = 1 / zoom;
+    for (const d of w.depots) {
+      if (d.claimed || d.expired) continue;
+      const cx = d.tx * T + 16, cy = d.ty * T + 16;
+      const R = 4 * T; 
+      if (cx + R < wx0 || cx - R > wx1 || cy + R < wy0 || cy - R > wy1) continue;
+
+      ctx.save();
+      ctx.globalAlpha = 0.9;
+      ctx.lineWidth = Math.max(3 * px, 10);
+      ctx.setLineDash([20, 20]);
+      ctx.strokeStyle = "#ffcc00";
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      
+      ctx.fillStyle = "rgba(255,204,0,0.15)";
+      ctx.fill();
+
+      const cs = d.side;
+      if (cs >= 0 && d.prog[cs] > 0) {
+        ctx.strokeStyle = COLOR_HEX[opt.colors[cs]];
+        ctx.lineWidth = Math.max(6 * px, 22);
+        ctx.beginPath();
+        ctx.arc(cx, cy, R * 0.82, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * d.prog[cs]);
+        ctx.stroke();
+      }
+
+      const s = Math.max(16 * px, 54);
+      ctx.fillStyle = "#ffcc00";
+      ctx.strokeStyle = "#1b1b1b";
+      ctx.lineWidth = Math.max(2 * px, 6);
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - s); ctx.lineTo(cx + s, cy); ctx.lineTo(cx, cy + s); ctx.lineTo(cx - s, cy); ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.font = `bold ${Math.max(14 * px, 42)}px sans-serif`;
+      ctx.textAlign = "center";
+      ctx.lineWidth = Math.max(3 * px, 8);
+      ctx.strokeStyle = "rgba(0,0,0,0.85)";
+      ctx.strokeText("Kho lương", cx, cy + s + Math.max(18 * px, 50));
+      ctx.fillStyle = "#fff6c8";
+      ctx.fillText("Kho lương", cx, cy + s + Math.max(18 * px, 50));
+      
+      ctx.restore();
+    }
+  }
+
   // Which forest zones are "opened" for the viewer (their own units inside).
   private revealPresence(w: World, viewer: number): Int32Array | null {
     if (viewer === 0 || viewer === 1) return w.presence[viewer];
@@ -595,15 +650,23 @@ export class Renderer {
 
   private drawUnitDots(ctx: CanvasRenderingContext2D, w: World, opt: ViewOptions, presence: Int32Array | null, wx0: number, wy0: number, wx1: number, wy1: number, ts: number) {
     const r = Math.min(3, Math.max(1.1, ts * 0.1)) / (ts / T); // screen-space half size
-    for (let s = 0; s < 2; s++) {
-      ctx.fillStyle = COLOR_HEX[opt.colors[s]];
+    const dotsByColor = new Map<string, number[]>();
+    for (let i = 0; i < w.n; i++) {
+      if (!w.alive[i]) continue;
+      const x = w.x[i], y = w.y[i];
+      if (x < wx0 || x > wx1 || y < wy0 || y > wy1) continue;
+      if (!this.unitVisible(w, i, opt, presence)) continue;
+      const color = (opt.ownerColors && w.owner[i] && opt.ownerColors[w.owner[i] as string]) || COLOR_HEX[opt.colors[w.side[i]]];
+      let dots = dotsByColor.get(color);
+      if (!dots) { dots = []; dotsByColor.set(color, dots); }
+      dots.push(x, y);
+    }
+    
+    for (const [color, dots] of dotsByColor.entries()) {
+      ctx.fillStyle = color;
       ctx.beginPath();
-      for (let i = 0; i < w.n; i++) {
-        if (!w.alive[i] || w.side[i] !== s) continue;
-        const x = w.x[i], y = w.y[i];
-        if (x < wx0 || x > wx1 || y < wy0 || y > wy1) continue;
-        if (!this.unitVisible(w, i, opt, presence)) continue;
-        ctx.rect(x - r, y - r * 2, r * 2, r * 2);
+      for (let k = 0; k < dots.length; k += 2) {
+        ctx.rect(dots[k] - r, dots[k + 1] - r * 2, r * 2, r * 2);
       }
       ctx.fill();
     }
@@ -655,7 +718,7 @@ export class Renderer {
   }
 
   // Depth-sorted pass: trees, buildings, sheep and unit sprites.
-  private drawSorted(ctx: CanvasRenderingContext2D, w: World, opt: ViewOptions, presence: Int32Array | null, time: number, tx0: number, ty0: number, tx1: number, ty1: number, wx0: number, wy0: number, wx1: number, wy1: number) {
+  private drawSorted(ctx: CanvasRenderingContext2D, w: World, opt: ViewOptions, presence: Int32Array | null, time: number, tx0: number, ty0: number, tx1: number, ty1: number, wx0: number, wy0: number, wx1: number, wy1: number, zoom: number) {
     const m = this.m, a = this.a;
     // key = y * 8 + kind, payload index packed in a parallel array
     const items: number[] = [];
@@ -713,11 +776,11 @@ export class Renderer {
         const src = w.shF[idx] < 0 ? a.flipped(st === 1 ? P.sheepMove : st === 2 ? P.sheepGrass : P.sheepIdle)! : img;
         const ff = w.shF[idx] < 0 ? frames - 1 - f : f;
         ctx.drawImage(src, ff * 128, 0, 128, 128, w.shX[idx] - 64 * 0.8, w.shY[idx] - 82 * 0.8, 128 * 0.8, 128 * 0.8);
-      } else this.drawUnit(ctx, w, idx, opt, time);
+      } else this.drawUnit(ctx, w, idx, opt, time, zoom);
     }
   }
 
-  private drawUnit(ctx: CanvasRenderingContext2D, w: World, i: number, opt: ViewOptions, time: number) {
+  private drawUnit(ctx: CanvasRenderingContext2D, w: World, i: number, opt: ViewOptions, time: number, zoom: number) {
     const color = opt.colors[w.side[i]];
     const ad = ANIMS[w.anim[i]];
     const path = unitPath(color, ad.file);
@@ -738,20 +801,12 @@ export class Renderer {
       ctx.beginPath();
       ctx.ellipse(x, y - 2, 16, 7, 0, 0, Math.PI * 2);
       ctx.stroke();
-    } else if (opt.myId && w.side[i] === opt.viewer) {
-      if (w.owner[i] === opt.myId) {
-        ctx.strokeStyle = "rgba(100, 255, 100, 0.35)";
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.ellipse(x, y - 2, 16, 7, 0, 0, Math.PI * 2);
-        ctx.stroke();
-      } else {
-        ctx.strokeStyle = "rgba(100, 150, 255, 0.25)";
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.ellipse(x, y - 2, 16, 7, 0, 0, Math.PI * 2);
-        ctx.stroke();
-      }
+    } else if (opt.ownerColors && w.owner[i]) {
+      ctx.strokeStyle = opt.ownerColors[w.owner[i]];
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(x, y - 2, 16, 7, 0, 0, Math.PI * 2);
+      ctx.stroke();
     }
     const swimming = w.m.ground[w.tile[i]] === WATER;
     if (swimming) {
@@ -773,6 +828,21 @@ export class Renderer {
       ctx.fillRect(x - 14, y - 58, 28, 5);
       ctx.fillStyle = COLOR_HEX[color];
       ctx.fillRect(x - 13, y - 57, 26 * Math.max(0, w.hp[i] / max), 3);
+    }
+    
+    if (zoom > 1.0) {
+      let icon = "";
+      if (w.berserk[i]) icon = "💢";
+      else if (w.disorder[i]) icon = "😵";
+      else if (w.encircled[i]) icon = "⭕";
+      else if (w.hold[i]) icon = "🛡️";
+      else if (w.rallyUntil[i] > time) icon = "⚔️";
+
+      if (icon) {
+        ctx.font = "14px Arial";
+        ctx.textAlign = "center";
+        ctx.fillText(icon, x, y - 65);
+      }
     }
   }
 

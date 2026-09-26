@@ -141,6 +141,7 @@ export class World {
   sel = new Uint8Array(CAP);
   owner = new Array<string | null>(CAP).fill(null);
   armyGroupId = new Int32Array(CAP).fill(-1);
+  squadId = new Int32Array(CAP).fill(-1);
   tile = new Int32Array(CAP);
   stuck = new Float32Array(CAP);
   formDX = new Float32Array(CAP);
@@ -221,8 +222,9 @@ export class World {
   gx = new Float32Array(CAP);
   gy = new Float32Array(CAP);
   // spatial grid (one cell per tile)
-  head = new Int32Array(N);
-  next = new Int32Array(CAP);
+  head = new Int32Array(N).fill(-1);
+  next = new Int32Array(CAP).fill(-1);
+  prev = new Int32Array(CAP).fill(-1);
   presence: [Int32Array, Int32Array];
   aliveCount: [number, number] = [0, 0];
   typeCount: [number[], number[]] = [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]];
@@ -342,6 +344,28 @@ export class World {
     return this.swim[i] === 1 || this.m.ground[this.tile[i]] === WATER;
   }
 
+  removeFromGrid(i: number) {
+    const p = this.prev[i];
+    const n = this.next[i];
+    if (p >= 0) this.next[p] = n;
+    else {
+      const t = this.tile[i];
+      if (this.head[t] === i) this.head[t] = n;
+    }
+    if (n >= 0) this.prev[n] = p;
+    this.prev[i] = -1;
+    this.next[i] = -1;
+  }
+
+  insertToGrid(i: number) {
+    const t = this.tile[i];
+    const h = this.head[t];
+    this.next[i] = h;
+    this.prev[i] = -1;
+    if (h >= 0) this.prev[h] = i;
+    this.head[t] = i;
+  }
+
   tryMove(i: number, vx: number, vy: number): boolean {
     const ox = this.x[i], oy = this.y[i], ot = this.tile[i];
     const nx = Math.min(WORLD_W - 2, Math.max(2, ox + vx));
@@ -360,7 +384,16 @@ export class World {
     this.x[i] = nx;
     this.y[i] = ny;
     if (nt !== ot) {
+      this.removeFromGrid(i);
       this.tile[i] = nt;
+      this.insertToGrid(i);
+      const zO = this.m.forest[ot];
+      const zN = this.m.forest[nt];
+      if (zO !== zN) {
+        const s = this.side[i];
+        if (zO) this.presence[s][zO]--;
+        if (zN) this.presence[s][zN]++;
+      }
       const gn = this.m.ground[nt];
       if ((gn === FORD || gn === WATER) && this.m.ground[ot] !== gn && this.rnd() < (gn === WATER ? 0.6 : 0.25)) this.addFx(FX_SPLASH, nx, ny, 0);
     }
@@ -393,17 +426,23 @@ export class World {
 
   // ------------------------------------------------------------ spawn
 
-  private addUnit(s: Side, t: number, px: number, py: number, ownerId: string | null = null) {
+  private nextSquadId = 1;
+
+  private addUnit(s: Side, t: number, px: number, py: number, ownerId: string | null = null, squadId?: number) {
     const i = this.n++;
     this.x[i] = px;
     this.y[i] = py;
     this.side[i] = s;
     this.type[i] = t;
     this.owner[i] = ownerId;
+    this.squadId[i] = squadId ?? this.nextSquadId++;
     this.hp[i] = STATS[t].hp;
     this.alive[i] = 1;
     this.face[i] = s === 0 ? 1 : -1;
     this.tile[i] = this.tileAt(px, py);
+    this.insertToGrid(i);
+    const z = this.m.forest[this.tile[i]];
+    if (z) this.presence[s][z]++;
     this.animT[i] = -this.rnd() * 2;
     this.anim[i] = this.idleAnim(i);
     this.anchorX[i] = px;
@@ -413,7 +452,7 @@ export class World {
     return i;
   }
 
-  private spawn(deploymentLayout?: { type: number, px: number, py: number, ownerId?: string | null, side?: number }[]) {
+  private spawn(deploymentLayout?: { type: number, px: number, py: number, ownerId?: string | null, side?: number, squadId?: number }[]) {
     const m = this.m;
     const rnd = mulberry32(m.seed ^ 0x5eed);
     
@@ -422,13 +461,13 @@ export class World {
       if (hasSides) {
         // PvP: Sử dụng layout đã tính toán riêng cho từng phe
         for (const b of deploymentLayout) {
-          this.addUnit(b.side! as Side, b.type, b.px, b.py, b.ownerId || null);
+          this.addUnit(b.side! as Side, b.type, b.px, b.py, b.ownerId || null, b.squadId);
         }
       } else {
         // AI: Tự động clone đạo quân sang 2 bên
         for (const b of deploymentLayout) {
-          this.addUnit(0, b.type, b.px, b.py, b.ownerId || null);
-          this.addUnit(1, b.type, WORLD_W - b.px, WORLD_H - b.py, null);
+          this.addUnit(0, b.type, b.px, b.py, b.ownerId || null, b.squadId);
+          this.addUnit(1, b.type, WORLD_W - b.px, WORLD_H - b.py, null, b.squadId ? b.squadId + 10000 : undefined);
         }
       }
       return;
@@ -465,8 +504,19 @@ export class World {
     }
 
     
-    for (const [t, px, py, owner] of west) this.addUnit(0, t, px, py, owner);
-    for (const [t, px, py, owner] of west) this.addUnit(1, t, WORLD_W - px, WORLD_H - py, null);
+    let squadIdCount = this.nextSquadId;
+    let unitCount = 0;
+    for (const [t, px, py, owner] of west) {
+      this.addUnit(0, t, px, py, owner, squadIdCount + Math.floor(unitCount / 100));
+      unitCount++;
+    }
+    squadIdCount += Math.floor(unitCount / 100) + 1;
+    unitCount = 0;
+    for (const [t, px, py, owner] of west) {
+      this.addUnit(1, t, WORLD_W - px, WORLD_H - py, null, squadIdCount + Math.floor(unitCount / 100));
+      unitCount++;
+    }
+    this.nextSquadId = squadIdCount + Math.floor(unitCount / 100) + 1;
     // Trinh sát: sinh 1 nhóm tập trung gần căn cứ, giữ vị trí chờ lệnh người chơi
     for (let s = 0 as Side; s <= 1; s = (s + 1) as Side) {
       // Điểm tập kết: gần cạnh bên trong, trung tâm theo chiều dọc
@@ -499,32 +549,7 @@ export class World {
     }
     
     // Gom nhóm đạo quân tự động (armyGroupId)
-    let nextGroupId = 0;
-    const maxDistSq = 120 * 120; // Thay vì 512, để các block đặt rời rạc sẽ tạo ra các armyGroupId riêng biệt
-    for (let i = 0; i < this.n; i++) {
-      if (this.type[i] === PAWN) continue; // Trinh sát không vào đạo quân
-      if (this.armyGroupId[i] !== -1) continue;
-      
-      // Bắt đầu một cụm mới
-      const q: number[] = [i];
-      this.armyGroupId[i] = nextGroupId;
-      let head = 0;
-      
-      while (head < q.length) {
-        const curr = q[head++];
-        for (let j = i + 1; j < this.n; j++) {
-          if (this.armyGroupId[j] === -1 && this.side[j] === this.side[curr] && this.type[j] !== PAWN) {
-            const dx = this.x[curr] - this.x[j];
-            const dy = this.y[curr] - this.y[j];
-            if (dx * dx + dy * dy <= maxDistSq) {
-              this.armyGroupId[j] = nextGroupId;
-              q.push(j);
-            }
-          }
-        }
-      }
-      nextGroupId++;
-    }
+    // Đã thay thế bằng squadId tĩnh
   }
 
   private pickNode(i: number) {
@@ -610,7 +635,7 @@ export class World {
     // Gom nhóm theo đạo quân; lính lẻ (không thuộc đạo quân nào) gom chung một khối
     const groups: Map<number, number[]> = new Map();
     for (const i of list) {
-      const g = this.armyGroupId[i];
+      const g = this.squadId[i];
       if (!groups.has(g)) groups.set(g, []);
       groups.get(g)!.push(i);
     }
@@ -665,7 +690,7 @@ export class World {
     // Bố trí nhiều khối theo lưới trước/sau (gần vuông: 4 nhánh → 2x2, 6 → 3x2...), không dàn hết
     // thành một hàng ngang. Ô lưới nào bị địa hình chắn thì khối lùi sang ô kế tiếp (ra sau / ra cánh).
     // Giữa các nhánh chừa khoảng trống rộng để dễ bấm chọn từng nhánh.
-    const BLOCK_GAP = 256; // px (4 ô) giữa hai khối
+    const BLOCK_GAP = 64; // px (ô) giữa hai khối
     let maxW = 0, maxD = 0;
     for (const b of blockCenters) { maxW = Math.max(maxW, b.w); maxD = Math.max(maxD, b.d); }
     const cellW = maxW + BLOCK_GAP, cellD = maxD + BLOCK_GAP;
@@ -1057,7 +1082,6 @@ export class World {
   step(dt: number) {
     this.time += dt;
     this.tick++;
-    this.rebuildGrid();
     this.engaged.fill(0);
     // Giới hạn vây đánh: chỉ đếm lính cận chiến đang ở SÁT mục tiêu (≤ ENGAGE_R). Đếm cả lính đứng xa
     // (cả nhánh cùng nhận một mục tiêu chung) làm mục tiêu "đầy" giả → cả nhánh đứng chờ, không đánh.
@@ -1594,23 +1618,8 @@ export class World {
   }
 
   private rebuildGrid() {
-    this.head.fill(-1);
-    const p0 = this.presence[0], p1 = this.presence[1];
-    p0.fill(0);
-    p1.fill(0);
-    const forest = this.m.forest;
-    // Đảo chiều chèn mỗi tick: đầu danh sách mỗi ô không luôn là lính chỉ số lớn (phe Đông).
-    // Thứ tự này quyết định ai được tách ra / chọn làm mục tiêu trước — để cố định sẽ thiên vị một phe.
-    const fwd = (this.tick & 1) === 0;
-    for (let k = 0; k < this.n; k++) {
-      const i = fwd ? k : this.n - 1 - k;
-      if (!this.alive[i]) continue;
-      const t = this.tile[i];
-      this.next[i] = this.head[t];
-      this.head[t] = i;
-      const z = forest[t];
-      if (z) (this.side[i] ? p1 : p0)[z]++;
-    }
+    // Spatial hash is now incrementally updated in tryMove / commit.
+    // This method is kept as a stub to avoid errors if called elsewhere.
   }
 
   // cap: bỏ qua địch đã có đủ `cap` lính cận chiến vây đánh (giới hạn mặt trận)
@@ -1808,7 +1817,19 @@ export class World {
       if (d2 >= SEP * SEP) continue;
       if (d2 < 0.01) { dx = this.rnd() - 0.5; dy = this.rnd() - 0.5; }
       const d = Math.sqrt(dx * dx + dy * dy) || 1;
-      const k = (SEP - d) / d * 0.8;
+      let k = (SEP - d) / d * 0.8;
+      
+      const sI = this.side[i];
+      const sJ = this.side[j];
+      const sqI = this.squadId[i];
+      if (sI === sJ) {
+        if (sqI !== -1 && sqI === this.squadId[j]) {
+          k *= 0.1; // Cùng Squad: Separation rất nhẹ
+        } else {
+          k *= 0.5; // Khác Squad cùng phe: Nhẹ hơn
+        }
+      }
+      
       pushX += dx * k;
       pushY += dy * k;
     }
@@ -1838,8 +1859,8 @@ export class World {
     // Ghi nhận mục tiêu và báo động cho cả phe (để cung thủ ở block khác cũng thấy)
     if (attackerId >= 0) this.lastHitBy[j] = attackerId;
     this.lastHitT[j] = this.time;
-    if (attackerId >= 0 && this.armyGroupId[j] !== -1) {
-      this.groupTarget[this.armyGroupId[j]] = attackerId;
+    if (attackerId >= 0 && this.squadId[j] !== -1) {
+      this.groupTarget[this.squadId[j]] = attackerId;
     }
     this.alertUntil[this.side[j]] = this.time + 3;
   }
@@ -1858,6 +1879,9 @@ export class World {
       const s = this.side[j], by = 1 - s;
       if (routed && this.type[j] !== PAWN) this.prestige[by] += 1 / ROUT_KILLS_PER_PRESTIGE;
       this.alive[j] = 0;
+      this.removeFromGrid(j);
+      const z = this.m.forest[this.tile[j]];
+      if (z) this.presence[s][z]--;
       this.aliveCount[s]--;
       this.typeCount[s][this.type[j]]--;
       this.kills[by]++;
@@ -1972,16 +1996,16 @@ export class World {
           tg = e;
           if (t !== ARCHER && this.engaged[e] < 255) this.engaged[e]++;
           this.alertUntil[s] = this.time + 3;
-          if (this.armyGroupId[i] !== -1) {
-            this.groupTarget[this.armyGroupId[i]] = e;
+          if (this.squadId[i] !== -1) {
+            this.groupTarget[this.squadId[i]] = e;
           }
         }
         else if (t === ARCHER) tg = -1;
       }
     }
     // Kế thừa mục tiêu từ đoàn quân nếu đang rảnh và không rút lui
-    if (!marching && tg < 0 && this.armyGroupId[i] !== -1 && t !== MONK && scan && this.buildTask[i] < 0) {
-      const gt = this.groupTarget[this.armyGroupId[i]];
+    if (!marching && tg < 0 && this.squadId[i] !== -1 && t !== MONK && scan && this.buildTask[i] < 0) {
+      const gt = this.groupTarget[this.squadId[i]];
       const melee = t !== ARCHER;
       const [lax, lay, lr] = this.leashArea(i);
       const inLeash = gt >= 0 && (!leash || (this.x[gt] - lax) ** 2 + (this.y[gt] - lay) ** 2 <= lr * lr);
@@ -2082,7 +2106,10 @@ export class World {
           return;
         }
         this.stuck[i] += dt;
-        if (this.stuck[i] > 0.6) { this.target[i] = -1; this.btarget[i] = -1; this.stuck[i] = 0; }
+        if (this.stuck[i] > 0.6) {
+          this.stuck[i] = 0;
+          this.formNoShort[i] = this.time + 1;
+        }
       }
     }
 

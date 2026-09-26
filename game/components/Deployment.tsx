@@ -39,8 +39,8 @@ export function Deployment({ socket, roomId, players, onStart, onCancel }: Deplo
   
   // Phân bổ khu vực (Fronts)
   const rowsPerPlayer = Math.floor(ROWS / Math.max(1, allies.length));
-  const getPlayerZone = (socketId: string) => {
-    const idx = allies.findIndex(a => a.socketId === socketId);
+  const getPlayerZone = (playerId: string) => {
+    const idx = allies.findIndex(a => a.playerId === playerId);
     if (idx === -1) return { start: 0, end: ROWS - 1 };
     return {
       start: idx * rowsPerPlayer,
@@ -163,19 +163,55 @@ export function Deployment({ socket, roomId, players, onStart, onCancel }: Deplo
     updateBlocksAndSync(newBlocks);
   };
 
+  const handleAutoDeploy = () => {
+    const newBlocks = [...blocks];
+    const availableCells: {gx: number, gy: number}[] = [];
+    
+    // Tìm các ô trống trong khu vực của mình
+    for (let x = 0; x < COLS; x++) {
+      for (let y = myZone.start; y <= myZone.end; y++) {
+        if (!newBlocks.some(b => b.gx === x && b.gy === y)) {
+          availableCells.push({gx: x, gy: y});
+        }
+      }
+    }
+    
+    // Xáo trộn
+    availableCells.sort(() => Math.random() - 0.5);
+    
+    let cellIdx = 0;
+    // Xếp tự động các khối quân chưa được đưa lên bàn (gx === -1) của mình
+    newBlocks.forEach(b => {
+      if (b.ownerId === myPlayerId && b.gx === -1 && cellIdx < availableCells.length) {
+        b.gx = availableCells[cellIdx].gx;
+        b.gy = availableCells[cellIdx].gy;
+        cellIdx++;
+      }
+    });
+    
+    updateBlocksAndSync(newBlocks);
+  };
+
   const handleStart = () => {
-    const layout: { type: number, px: number, py: number, ownerId: string | null }[] = [];
+    if (socket && roomId) {
+      socket.emit("start_pvp_match", roomId);
+      return;
+    }
+    const layout: { type: number, px: number, py: number, ownerId: string | null, side?: number, squadId?: number }[] = [];
     const { xMin, yMin } = DEPLOYMENT_BOUNDS.WEST; // Phe Đông sẽ tự lật ngược ở world.ts
     
     const GRID_SIZE_WORLD = 9 * T; // 576
+    let squadCounter = 0;
     blocks.forEach(b => {
       if (b.gx === -1) return;
       const blockPx = (xMin * T) + (b.gx * GRID_SIZE_WORLD);
       const blockPy = (yMin * T) + (b.gy * GRID_SIZE_WORLD);
       
+      const currentSquad = squadCounter++;
+      
       for (let c = 0; c < 10; c++) {
         for (let r = 0; r < 10; r++) {
-          layout.push({ type: b.type, px: blockPx + 144 + c * 32, py: blockPy + 144 + r * 32, ownerId: b.ownerId });
+          layout.push({ type: b.type, px: blockPx + 144 + c * 32, py: blockPy + 144 + r * 32, ownerId: b.ownerId, squadId: currentSquad });
         }
       }
     });
@@ -287,6 +323,10 @@ export function Deployment({ socket, roomId, players, onStart, onCancel }: Deplo
           
           <button className="ts-btn w-full mb-2 py-1 rounded text-sm bg-[#8b3d2b] text-white" onClick={handleRecallAll}>
             Thu hồi quân của tôi trên bàn
+          </button>
+          
+          <button className="ts-btn w-full mb-2 py-1 rounded text-sm bg-[#5a8c43] text-white" onClick={handleAutoDeploy}>
+            Tự động bố trí đội hình
           </button>
 
           {isGeneral && (
