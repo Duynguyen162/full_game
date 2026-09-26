@@ -23,6 +23,7 @@ export interface ViewOptions {
   colors: [TeamColor, TeamColor];
   showClouds: boolean;
   showNav: boolean;
+  myId?: string;
   // Chủ sở hữu mục tiêu mà người xem biết được (cập nhật khi có tầm nhìn). null = dùng giá trị thật.
   objKnown?: Int8Array | null;
 }
@@ -737,8 +738,21 @@ export class Renderer {
       ctx.beginPath();
       ctx.ellipse(x, y - 2, 16, 7, 0, 0, Math.PI * 2);
       ctx.stroke();
+    } else if (opt.myId && w.side[i] === opt.viewer) {
+      if (w.owner[i] === opt.myId) {
+        ctx.strokeStyle = "rgba(100, 255, 100, 0.35)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.ellipse(x, y - 2, 16, 7, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = "rgba(100, 150, 255, 0.25)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.ellipse(x, y - 2, 16, 7, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      }
     }
-    // Đang bơi: chìm nửa người dưới mặt nước + gợn sóng
     const swimming = w.m.ground[w.tile[i]] === WATER;
     if (swimming) {
       ctx.save();

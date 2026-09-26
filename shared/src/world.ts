@@ -139,6 +139,7 @@ export class World {
   alive = new Uint8Array(CAP);
   hold = new Uint8Array(CAP);
   sel = new Uint8Array(CAP);
+  owner = new Array<string | null>(CAP).fill(null);
   armyGroupId = new Int32Array(CAP).fill(-1);
   tile = new Int32Array(CAP);
   stuck = new Float32Array(CAP);
@@ -392,12 +393,13 @@ export class World {
 
   // ------------------------------------------------------------ spawn
 
-  private addUnit(s: Side, t: number, px: number, py: number) {
+  private addUnit(s: Side, t: number, px: number, py: number, ownerId: string | null = null) {
     const i = this.n++;
     this.x[i] = px;
     this.y[i] = py;
     this.side[i] = s;
     this.type[i] = t;
+    this.owner[i] = ownerId;
     this.hp[i] = STATS[t].hp;
     this.alive[i] = 1;
     this.face[i] = s === 0 ? 1 : -1;
@@ -411,49 +413,60 @@ export class World {
     return i;
   }
 
-  private spawn(deploymentLayout?: { type: number, px: number, py: number }[]) {
+  private spawn(deploymentLayout?: { type: number, px: number, py: number, ownerId?: string | null, side?: number }[]) {
     const m = this.m;
     const rnd = mulberry32(m.seed ^ 0x5eed);
     
-    const west: [number, number, number][] = [];
-    
     if (deploymentLayout && deploymentLayout.length > 0) {
-      // Dùng sơ đồ bố trí của người chơi
-      for (const b of deploymentLayout) {
-        west.push([b.type, b.px, b.py]);
+      const hasSides = deploymentLayout.some(b => b.side !== undefined);
+      if (hasSides) {
+        // PvP: Sử dụng layout đã tính toán riêng cho từng phe
+        for (const b of deploymentLayout) {
+          this.addUnit(b.side! as Side, b.type, b.px, b.py, b.ownerId || null);
+        }
+      } else {
+        // AI: Tự động clone đạo quân sang 2 bên
+        for (const b of deploymentLayout) {
+          this.addUnit(0, b.type, b.px, b.py, b.ownerId || null);
+          this.addUnit(1, b.type, WORLD_W - b.px, WORLD_H - b.py, null);
+        }
       }
-    } else {
-      // Bố trí tự động mặc định (cũ / AI)
-      const sp = 40;
-      const blk = 10;
-      const frontX = (SPAWN_W - 5) * T;
-      const cy = (MH / 2) * T;
-      const rows = 8;
-      const order: number[] = [0];
-      for (let k = 1; order.length < rows; k++) { order.push(k); if (order.length < rows) order.push(-k); }
-      
-      let ai = 0, left = ARMY[0][1];
-      outer: for (let cb = 0; cb < 20; cb++) {
-        for (const rb of order) {
-          const bx = frontX - cb * (blk + 2) * sp;
-          const by = cy + rb * (blk + 2) * sp - (blk * sp) / 2;
-          for (let c = 0; c < blk; c++) for (let r = 0; r < blk; r++) {
-            const px = bx - c * sp + (rnd() - 0.5) * 6;
-            const py = by + r * sp + (rnd() - 0.5) * 6;
-            const t = this.tileAt(px, py);
-            if (!passable(m, t) || m.level[t] !== 0 || m.forest[t] || m.ramp[t]) continue;
-            west.push([ARMY[ai][0], px, py]);
-            if (--left === 0) {
-              if (++ai >= ARMY.length) break outer;
-              left = ARMY[ai][1];
-            }
+      return;
+    }
+    
+    const west: [number, number, number, string | null][] = [];
+    
+    // Bố trí tự động mặc định (cũ / AI)
+    const sp = 40;
+    const blk = 10;
+    const frontX = (SPAWN_W - 5) * T;
+    const cy = (MH / 2) * T;
+    const rows = 8;
+    const order: number[] = [0];
+    for (let k = 1; order.length < rows; k++) { order.push(k); if (order.length < rows) order.push(-k); }
+    
+    let ai = 0, left = ARMY[0][1];
+    outer: for (let cb = 0; cb < 20; cb++) {
+      for (const rb of order) {
+        const bx = frontX - cb * (blk + 2) * sp;
+        const by = cy + rb * (blk + 2) * sp - (blk * sp) / 2;
+        for (let c = 0; c < blk; c++) for (let r = 0; r < blk; r++) {
+          const px = bx - c * sp + (rnd() - 0.5) * 6;
+          const py = by + r * sp + (rnd() - 0.5) * 6;
+          const t = this.tileAt(px, py);
+          if (!passable(m, t) || m.level[t] !== 0 || m.forest[t] || m.ramp[t]) continue;
+          west.push([ARMY[ai][0], px, py, null]);
+          if (--left === 0) {
+            if (++ai >= ARMY.length) break outer;
+            left = ARMY[ai][1];
           }
         }
       }
     }
+
     
-    for (const [t, px, py] of west) this.addUnit(0, t, px, py);
-    for (const [t, px, py] of west) this.addUnit(1, t, WORLD_W - px, WORLD_H - py);
+    for (const [t, px, py, owner] of west) this.addUnit(0, t, px, py, owner);
+    for (const [t, px, py, owner] of west) this.addUnit(1, t, WORLD_W - px, WORLD_H - py, null);
     // Trinh sát: sinh 1 nhóm tập trung gần căn cứ, giữ vị trí chờ lệnh người chơi
     for (let s = 0 as Side; s <= 1; s = (s + 1) as Side) {
       // Điểm tập kết: gần cạnh bên trong, trung tâm theo chiều dọc
@@ -983,23 +996,27 @@ export class World {
     this.started = true;
   }
 
-  selectRect(x0: number, y0: number, x1: number, y1: number, sideFilter: number, add = false) {
+  selectRect(x0: number, y0: number, x1: number, y1: number, sideFilter: number, add = false, ownerFilter?: string | null) {
     if (!add) this.sel.fill(0);
     const ax = Math.min(x0, x1), bx = Math.max(x0, x1), ay = Math.min(y0, y1), by = Math.max(y0, y1);
     let c = 0;
     for (let i = 0; i < this.n; i++) {
       if (!this.alive[i]) continue;
       if (sideFilter >= 0 && this.side[i] !== sideFilter) continue;
+      if (ownerFilter && this.owner[i] !== ownerFilter) continue; // Lọc chủ sở hữu
       const px = this.x[i], py = this.y[i] - 20;
       if (px >= ax && px <= bx && py >= ay && py <= by) { this.sel[i] = 1; c++; }
     }
     return c;
   }
 
-  selectType(t: number, sideFilter: number) {
+  selectType(t: number, sideFilter: number, ownerFilter?: string | null) {
     this.sel.fill(0);
     for (let i = 0; i < this.n; i++) {
-      if (this.alive[i] && (t < 0 || this.type[i] === t) && (sideFilter < 0 || this.side[i] === sideFilter) && (t === PAWN || this.type[i] !== PAWN)) this.sel[i] = 1;
+      if (this.alive[i] && (t < 0 || this.type[i] === t) && (sideFilter < 0 || this.side[i] === sideFilter) && (t === PAWN || this.type[i] !== PAWN)) {
+        if (ownerFilter && this.owner[i] !== ownerFilter) continue;
+        this.sel[i] = 1;
+      }
     }
   }
 
@@ -1116,6 +1133,13 @@ export class World {
     }
   }
 
+  // Chức năng đầu hàng chủ động
+  surrender(side: number) {
+    if (this.winner >= 0) return;
+    this.setWinner(1 - side, "surrender");
+    this.pushEvent(-1, `Phe ${side === 0 ? "Tây" : "Đông"} đã đầu hàng!`);
+  }
+
   // ---- V2: Cứ điểm sông, cờ cao nguyên, Đầu cầu, cờ cô lập & Uy thế (3Hz)
   private updateObjectives(dtv: number) {
     const m = this.m;
@@ -1175,13 +1199,19 @@ export class World {
       }
     }
     this.bridgehead = bh;
+    
+    // V2: Đầu cầu toàn cục (có bất kỳ cứ điểm sông nào HOẶC có cầu tự xây đã hoàn thành)
+    const globalBh = [
+      riverCount[0] > 0 || this.builtBridges.some((b) => b.side === 0 && b.alive && b.done),
+      riverCount[1] > 0 || this.builtBridges.some((b) => b.side === 1 && b.alive && b.done),
+    ];
 
-    // 2) V2: Uy thế từ cờ — chỉ khi có đầu cầu ở mặt trận đó
+    // 2) V2: Uy thế từ cờ — chỉ khi có đầu cầu toàn cục
     for (const o of this.obj) {
       if (o.kind !== OBJ_FLAG) continue;
       const ow = this.objOwner[o.id];
       if (ow < 0 || ow === o.home) continue; // chưa chiếm hoặc cờ nhà → không cho điểm
-      if (bh[ow][o.front]) {
+      if (globalBh[ow]) {
         // Có đầu cầu → cờ cho điểm
         this.prestige[ow] += FLAG_BRIDGEHEAD_RATE * dtv;
         this.flagIsolateT[o.id] = 0; // reset cô lập timer
@@ -1189,7 +1219,7 @@ export class World {
         // Mất đầu cầu → cờ bị cô lập, không cho điểm
         if (this.flagIsolateT[o.id] === 0) {
           this.flagIsolateT[o.id] = this.time;
-          this.pushEvent(1 - ow, `Mất đầu cầu ${o.front === 0 ? "Bắc" : "Nam"} — cờ bị cô lập, còn ${FLAG_ISOLATE_T}s`);
+          this.pushEvent(1 - ow, `Mất toàn bộ đầu cầu — cờ bị cô lập, còn ${FLAG_ISOLATE_T}s`);
         }
         // Sau FLAG_ISOLATE_T giây, cờ tự trả về cho chủ cũ
         if (this.time - this.flagIsolateT[o.id] >= FLAG_ISOLATE_T) {

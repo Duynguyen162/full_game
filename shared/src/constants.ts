@@ -58,7 +58,7 @@ export const COLOR_VI: Record<TeamColor, string> = {
 
 // ---- Luật chiến thắng "Đầu cầu" bản 2 (xem docs/rules_v2_dau_cau.md)
 export const PRESTIGE_WIN = 500;        // Uy thế cần để thắng (V2: 500)
-export const TIME_LIMIT = 20 * 60;      // giây game; hết giờ thì so Uy thế
+export const TIME_LIMIT = 60 * 60;      // giây game; hết giờ thì so Uy thế
 export const SURRENDER_FRAC = 0.15;     // còn dưới 15% quân chiến đấu → đầu hàng
 
 // ---- Uy thế V2
@@ -128,7 +128,7 @@ export const DEPLOYMENT_BOUNDS = {
   EAST: { xMin: 414, xMax: 462, yMin: 160, yMax: 352 },
 };
 // Khoảng cách tối đa (pixel) giữa các khối quân để tự động gom chung thành 1 đạo quân
-export const ARMY_GROUP_LINK_DISTANCE = 512; // 8 ô bản đồ
+export const ARMY_GROUP_LINK_DISTANCE = 256; // 4 ô bản đồ
 
 // ---- Cờ nhà (V2 mục 4): lợi thế phòng thủ
 export const FLAG_HOME_HEAL_R = 12;       // bán kính hồi máu quanh cờ nhà (ô)
